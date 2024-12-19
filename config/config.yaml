@@ -1,0 +1,141 @@
+# Project settings
+project:
+  name: sheetz-rec-poc
+  environment: development
+
+# Google Cloud settings
+gcp:
+  project_id: sheetz-poc
+  dataset_id: sheetz_data
+  location: us-central1
+  staging_bucket: gs://sheetz-rec-staging
+  vertex:
+    # Machine configuration
+    machine_type: n1-standard-8
+    accelerator_type: NVIDIA_TESLA_T4
+    accelerator_count: 1
+    
+    # Training configuration
+    service_account: vertex-training@sheetz-poc.iam.gserviceaccount.com
+    container_image: gcr.io/sheetz-poc/recommender-training:latest
+    
+    # Scale settings
+    replica_count: 1
+    worker_pool_specs:
+      machine_type: n1-standard-8
+      replica_count: 1
+      container_image: gcr.io/sheetz-poc/recommender-training:latest
+      
+    # Job configuration
+    job_display_name_prefix: sheetz_ncf_training
+    base_output_dir: gs://sheetz-rec-staging/training_jobs
+    enable_web_access: true
+    
+    # Monitoring
+    tensorboard:
+      enabled: true
+      instance_name: sheetz-training-tb
+    
+    # Resource limits
+    timeout_hours: 24
+    max_running_time: 86400  # 24 hours in seconds
+    max_retry_count: 3
+
+# Model settings
+model:
+  ncf:
+    # Architecture
+    embedding_dim: 64
+    layers: [256, 128, 64]
+    dropout: 0.2
+    num_heads: 4
+    temporal_dim: 32
+    
+    # Training
+    learning_rate: 0.001
+    weight_decay: 1e-5
+    batch_size: 256
+    epochs: 50
+    validation_days: 10
+    negative_samples: 4
+    num_workers: 4
+    
+    # Optimization
+    gradient_clipping: 5.0
+    early_stopping_patience: 5
+    reduce_lr_patience: 3
+    reduce_lr_factor: 0.5
+    
+    # Mixed precision training
+    use_amp: true
+    opt_level: O1
+    
+    # Checkpointing
+    save_freq: 5
+    keep_last_n: 3
+    
+    # Files
+    model_save_path: models/ncf_model.pt
+    history_save_path: models/training_history.pt
+    
+    # Evaluation
+    metrics:
+      - hit_rate@10
+      - ndcg@10
+      - mrr@10
+      - map@10
+    eval_batch_size: 512
+
+# Logging settings
+logging:
+  level: INFO
+  file: logs/training.log
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  
+  # Cloud Logging
+  cloud_logging:
+    enabled: true
+    log_name: sheetz_training_logs
+  
+  # Monitoring
+  metrics_export:
+    enabled: true
+    export_interval: 60  # seconds
+    custom_metrics:
+      - training_loss
+      - validation_loss
+      - hit_rate
+      - ndcg
+    alert_thresholds:
+      training_loss_max: 5.0
+      validation_no_improvement_epochs: 10
+
+# Data settings
+data:
+  validation_split: 0.1
+  test_split: 0.1
+  min_interactions: 5  # Minimum interactions per user
+  max_interactions: 100  # Maximum interactions per user (for memory efficiency)
+  seed: 42
+  
+  # Feature processing
+  sequence_length: 50
+  temporal_features:
+    max_days: 365
+    include_time_of_day: true
+    include_day_of_week: true
+    include_month: true
+  
+  # Caching
+  cache_features: true
+  cache_dir: gs://sheetz-rec-staging/feature_cache
+  cache_ttl_hours: 24
+
+# Experiment tracking
+experiment:
+  enabled: true
+  project_name: sheetz_recommendations
+  tracking_uri: gs://sheetz-rec-staging/mlflow
+  tags:
+    model_version: ncf_v1
+    environment: development

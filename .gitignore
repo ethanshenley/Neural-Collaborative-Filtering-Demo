@@ -1,2 +1,5 @@
 __pycache__
 ,env
+sheetz_rec.egg-info/
+logs/
+codebase.md

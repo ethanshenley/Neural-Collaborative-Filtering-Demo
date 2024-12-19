@@ -1,0 +1,56 @@
+RESPONSES FROM GEMINIPRO TEST
+
+(sheetz) (base) ethan@ethan-ThinkPad-P16s-Gen-2:~/Sheetz-POC$ python src/llm/test_product_generation.py
+2024-12-09 23:42:04,078 - INFO - Initialized Vertex AI client with gemini-pro
+2024-12-09 23:42:04,079 - INFO - 
+Testing MTO category:
+
+MTO Products:
+## Sheetz Fresh Kitchen Creations:
+
+1. **The Fully Customizable (12-inch) [Choice of Bread/Base, Protein, Cheese, Toppings, Sauce, Temperature]** - Build your own masterpiece with our wide selection of fresh ingredients. Choose from classic Italian, hearty Turkey & Swiss, or veggie-packed Falafel. 
+2. **Southwest Chicken Wrap (Large) [Flour Tortilla, Grilled Chicken, Black Bean & Corn Salsa, Avocado, Chipotle Mayo, Cold]** - A zesty and flavorful wrap packed with protein and fresh veggies. 
+3. **California Veggie Burger (6-inch) [Gluten-Free Bun, Black Bean Patty, Avocado, Sprouts, Roasted Red Peppers, Pesto Aioli, Warm]** - A satisfying vegetarian option with a delicious Mediterranean twist. 
+
+--------------------------------------------------------------------------------
+2024-12-09 23:42:07,621 - INFO - 
+Testing RTE category:
+
+RTE Products:
+## Sheetz Fresh Food Options:
+
+1. **Loaded Baked Potato Bar (Individual, Sharing Size)** [Potato, Choice of Protein (Shredded Chicken, Pulled Pork, Chili), Cheese, Broccoli, Sour Cream, Salsa, Chives] 
+* **Vegetarian Option:** Omit meat and cheese, add additional toppings like roasted vegetables or guacamole.
+* **Gluten-Free Option:** Choose chili as your protein and omit cheese. 
+
+2. **Chicken Caesar Wrap (Individual)** [Grilled Chicken, Romaine Lettuce, Parmesan Cheese, Caesar Dressing, Croutons] 
+* **Customization Options:** Add avocado or bacon for extra flavor. 
+* **Gluten-Free Option:** Choose a gluten-free wrap option. 
+
+3. **Build-Your-Own Salad Bowl (Individual, Sharing Size, Family Size)** [Choice of Base (Spring Mix, Spinach, Kale), Choice of Protein (Grilled Chicken, Tofu, Hard-Boiled Eggs), Choice of 3 Toppings (Tomatoes, Cucumbers, Carrots, Peppers, Onions, Black Olives, Croutons), Choice of Dressing] 
+* **Dietary Options:** Choose tofu or hard-boiled eggs for a vegetarian option. Many toppings and dressings are naturally vegan or gluten-free. 
+* **Customization Options:** Add additional toppings for a personalized salad experience. 
+
+--------------------------------------------------------------------------------
+2024-12-09 23:42:11,371 - INFO - 
+Testing HOT category:
+
+HOT Products:
+## Sheetz Hot Food Menu:
+
+1. **Giant Chicken Tenders (Regular, Large, Family Size) [Crispy or Grilled, Choice of Dipping Sauce (Honey Mustard, BBQ, Ranch), Optional Side of Fries or Mac & Cheese]**
+2. **Ultimate Cheesesteak (Regular, Large) [Choice of Steak or Chicken, Grilled Onions & Peppers, Cheez Whiz or American Cheese, Optional Side of Onion Rings or Cole Slaw]**
+3. **Loaded Mac & Cheese (Regular, Large, Family Size) [Creamy Cheese Sauce, Choice of Bacon, Broccoli, or Chili, Gluten-Free Pasta Option Available, Optional Side of Garlic Bread or Salad]** 
+
+--------------------------------------------------------------------------------
+2024-12-09 23:42:13,418 - INFO - 
+Testing BEV category:
+
+BEV Products:
+## Sheetz Beverage Variety:
+
+1. **Coca-Cola Classic (20oz) [Cold, Regular Sugar, Regular Caffeine, Can]**
+2. **Monster Energy Ultra Zero (16oz) [Cold, Sugar-Free, High Caffeine, Can]**
+3. **Dasani Purified Water (32oz) [Cold, Sugar-Free, Caffeine-Free, Bottle]**
+--------------------------------------------------------------------------------
+(sheetz) (base) ethan@ethan-ThinkPad-P16s-Gen-2:~/Sheetz-POC$ 
