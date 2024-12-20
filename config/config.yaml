@@ -9,11 +9,18 @@ gcp:
   dataset_id: sheetz_data
   location: us-central1
   staging_bucket: gs://sheetz-rec-staging
-  vertex:
-    # Machine configuration
+vertex:
+  machine_config:
     machine_type: n1-standard-8
-    accelerator_type: NVIDIA_TESLA_T4
-    accelerator_count: 1
+    accelerator_config:
+      core_count: 1
+      type: NVIDIA_TESLA_T4
+    container_image:
+      repository: gcr.io/sheetz-poc/recommender-training
+      tag: latest
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:512"
+      NCCL_DEBUG: "INFO"
     
     # Training configuration
     service_account: vertex-training@sheetz-poc.iam.gserviceaccount.com

@@ -122,7 +122,8 @@ class AdvancedNCF(nn.Module):
         mlp_hidden_dims: List[int] = [256, 128, 64],
         num_heads: int = 4,
         dropout: float = 0.2,
-        max_sequence_length: int = 50
+        max_sequence_length: int = 50,
+        use_distributed: bool = False
     ):
         super().__init__()
         
