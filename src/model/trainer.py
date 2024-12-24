@@ -2,13 +2,16 @@
 
 import torch
 import torch.nn as nn
+
 from torch.utils.data import DataLoader
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+
 from torchrec import KeyedJaggedTensor
 from typing import Dict, Any, List, Tuple
 import pandas as pd
 from tqdm import tqdm
+
 from src.model.data_prep import SheetzDataset, create_data_loaders, collate_recommender_batch, ConsistentBatchSampler
 from src.utils.metrics import calculate_metrics
 from src.data.negative_sampler import NegativeSampler
@@ -89,18 +92,7 @@ class ModelTrainer:
         num_workers: int = 4,
         validation_days: int = 10
     ) -> Tuple[DataLoader, DataLoader]:
-        """Create training and validation data loaders
-        
-        Args:
-            user_features_df: DataFrame with user features
-            product_features_df: DataFrame with product features
-            batch_size: Batch size for training
-            num_workers: Number of worker processes
-            validation_days: Number of days to use for validation
-            
-        Returns:
-            Tuple of (train_loader, val_loader)
-        """
+        """Create training and validation data loaders"""
         logging.info("Creating data loaders...")
         
         # Create datasets
@@ -126,7 +118,6 @@ class ModelTrainer:
             dataset_size=len(train_dataset),
             batch_size=batch_size,
             shuffle=True,
-            drop_last=False
         )
         
         # Create data loaders
@@ -149,33 +140,45 @@ class ModelTrainer:
         logging.info(f"Created train loader with {len(train_loader)} batches")
         logging.info(f"Created val loader with {len(val_loader)} batches")
         
-        # Verify batch sizes
-        for i, (features, targets) in enumerate(train_loader):
-            batch_size = features.size(0)
+        # Verify first batch
+        for features, targets in train_loader:
+            # For KeyedJaggedTensor, we can get batch size from lengths
+            batch_size = len(features.lengths()) // len(features.keys())
             if batch_size < 2:
-                logging.warning(f"Small batch detected in train loader: {batch_size}")
-            if i == 0:
-                logging.info(f"First batch size: {batch_size}")
-            if i >= 5:  # Check first few batches
-                break
-                
+                logging.warning(f"Small batch detected: {batch_size}")
+            logging.info(f"First batch size: {batch_size}")
+            break
+                    
         return train_loader, val_loader
 
     @staticmethod
-    def collate_recommender_batch(batch):
-        """Custom collate function for batching KeyedJaggedTensor samples"""
+    def collate_recommender_batch(batch: List[Tuple[KeyedJaggedTensor, torch.Tensor]]) -> Tuple[KeyedJaggedTensor, torch.Tensor]:
+        """Collate function with proper batch handling"""
         features_list = []
         targets_list = []
         
-        for features, targets in batch:
-            features_list.append(features)
-            targets_list.append(targets)
-            
-        # Concatenate KeyedJaggedTensors
-        batched_features = KeyedJaggedTensor.concat(features_list)
-        batched_targets = torch.cat(targets_list)
+        # Collect all values and lengths for each key
+        values_dict = {'user_id': [], 'product_id': []}
+        lengths_dict = {'user_id': [], 'product_id': []}
         
-        return batched_features, batched_targets
+        for features, targets in batch:
+            # Extract values and lengths for each key
+            for key in ['user_id', 'product_id']:
+                values = features[key].values()
+                lengths = features[key].lengths()
+                values_dict[key].extend(values)
+                lengths_dict[key].append(lengths)
+                
+            targets_list.append(targets)
+
+        # Create concatenated KeyedJaggedTensor
+        concatenated_features = KeyedJaggedTensor.from_lengths_sync(
+            keys=['user_id', 'product_id'],
+            values=torch.cat([torch.tensor(values_dict[k]) for k in ['user_id', 'product_id']]),
+            lengths=torch.cat([torch.tensor(lengths_dict[k]) for k in ['user_id', 'product_id']])
+        )
+        
+        return concatenated_features, torch.cat(targets_list)
     
     @retry.Retry(
         initial=1.0,
@@ -228,14 +231,16 @@ class ModelTrainer:
         
         with tqdm(train_loader, desc="Training") as pbar:
             for batch_idx, (features, targets) in enumerate(pbar):
-                # Check batch size using KeyedJaggedTensor methods
-                batch_size = len(features.values()) // len(features.keys())
+                # Calculate batch size from KeyedJaggedTensor
+                batch_size = len(features.lengths()) // len(features.keys())
                 if batch_size < 2:
-                    logging.warning(f"Small batch detected: {batch_size}")
+                    logging.warning(
+                        f"Skipping small batch: {batch_size} < {self.config['batch_size']}"
+                )
                     continue
                     
                 # Move to device
-                features = features.to(self.device)
+                features = features.to(self.device)  # Add this line
                 targets = targets.to(self.device)
                 
                 # Forward pass
@@ -248,7 +253,6 @@ class ModelTrainer:
                     logging.error(f"Feature keys: {features.keys()}")
                     raise
                     
-                # Rest of training logic...                    
                 # Backward pass
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -262,7 +266,7 @@ class ModelTrainer:
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     'avg_loss': f'{total_loss/num_batches:.4f}',
-                    'batch_size': features.size(0)
+                    'batch_size': batch_size
                 })
                 
         return total_loss / num_batches if num_batches > 0 else float('inf')
@@ -276,21 +280,16 @@ class ModelTrainer:
         
         with torch.no_grad():
             for features, targets in tqdm(val_loader, desc="Validation"):
-                # Forward pass
+                # Move features to GPU
+                features = features.to(self.device)  # Add this line
+                targets = targets.to(self.device)
+                
                 outputs = self.model(features)
                 loss = self.criterion(outputs, targets)
                 
                 total_loss += loss.item()
                 all_predictions.append(outputs)
                 all_targets.append(targets)
-        
-        # Calculate metrics
-        predictions = torch.cat(all_predictions)
-        targets = torch.cat(all_targets)
-        metrics = calculate_metrics(predictions, targets)
-        metrics['loss'] = total_loss / len(val_loader)
-        
-        return metrics
     
     def train(
         self,

@@ -238,66 +238,61 @@ class SheetzDataset(Dataset):
             return features, torch.tensor([1.0], dtype=torch.float)
               
 def collate_recommender_batch(batch: List[Tuple[KeyedJaggedTensor, torch.Tensor]]) -> Tuple[KeyedJaggedTensor, torch.Tensor]:
-    """Collate function for recommendation data
-    
-    Args:
-        batch: List of (features, targets) tuples
-        
-    Returns:
-        Tuple of (batched_features, batched_targets)
-    """
+    """Collate function with proper batch size guarantees"""
     features_list = []
     targets_list = []
     
+    # Collect values and lengths for each key separately
+    all_values = {
+        'user_id': [],
+        'product_id': []
+    }
+    all_lengths = {
+        'user_id': [],
+        'product_id': []
+    }
+    
     for features, targets in batch:
-        features_list.append(features)
+        # Ensure minimum batch size
         targets_list.append(targets)
         
-    # Ensure minimum batch size of 2 for BatchNorm
-    if len(features_list) == 1:
-        logging.warning("Small batch detected, duplicating sample")
-        features_list.append(features_list[0])
-        targets_list.append(targets_list[0])
-        
-    try:
-        # Use concat instead of from_tensors_list
-        batched_features = KeyedJaggedTensor.concat(features_list)
-        batched_targets = torch.cat(targets_list)
-        
-        # Log shape info using KeyedJaggedTensor methods
-        logging.info(f"Batch size: {len(features_list)}")
-        logging.info(f"Keys: {batched_features.keys()}")
-        logging.info(f"Values length: {len(batched_features.values())}")
-        
-        return batched_features, batched_targets
-    except Exception as e:
-        logging.error(f"Error in collate function: {str(e)}")
-        # Use proper KeyedJaggedTensor inspection methods
-        logging.error(f"Batch size: {len(features_list)}")
-        for feat in features_list:
-            logging.error(f"Feature keys: {feat.keys()}")
-            logging.error(f"Feature values length: {len(feat.values())}")
-        raise
+        # Extract values and lengths correctly
+        for key in ['user_id', 'product_id']:
+            key_values = features[key].values()
+            key_lengths = features[key].lengths()
+            all_values[key].extend(key_values.tolist())
+            all_lengths[key].extend(key_lengths.tolist())
     
+    # Create concatenated KeyedJaggedTensor with proper key structure
+    try:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=['user_id', 'product_id'],
+            values=torch.tensor(all_values['user_id'] + all_values['product_id'], dtype=torch.long),
+            lengths=torch.tensor(all_lengths['user_id'] + all_lengths['product_id'], dtype=torch.long)
+        )
+        
+        return features, torch.cat(targets_list)
+    except Exception as e:
+        logging.error(f"Failed to create KeyedJaggedTensor: {str(e)}")
+        logging.error(f"Values shape: {len(all_values['user_id'] + all_values['product_id'])}")
+        logging.error(f"Lengths shape: {len(all_lengths['user_id'] + all_lengths['product_id'])}")
+        raise
+
 def create_data_loaders(
     self,
-    user_features_df,  # Changed from user_stats_df
-    product_features_df,  # Changed from product_stats_df 
+    user_features_df: pd.DataFrame,
+    product_features_df: pd.DataFrame, 
     batch_size: int = 256,
     num_workers: int = 4,
     validation_days: int = 10
-) -> Tuple[DataLoader, DataLoader]:
-    """Create training and validation data loaders."""
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Create training, validation and test data loaders."""
     
-    if not hasattr(self, 'user_product_history') and self.mode == 'train':
-        logging.warning("user_product_history not initialized for training dataset")
-        self._create_user_product_history()
-
     # Create training dataset
     train_dataset = SheetzDataset(
         interactions_df=self.create_interactions_df(),
-        user_features_df=user_features_df,     # Changed parameter name
-        product_features_df=product_features_df,  # Changed parameter name
+        user_features_df=user_features_df,
+        product_features_df=product_features_df,
         mode='train',
         validation_days=validation_days,
         negative_samples=self.config.get('negative_samples', 4)
@@ -305,37 +300,44 @@ def create_data_loaders(
     
     val_dataset = SheetzDataset(
         interactions_df=self.create_interactions_df(),
-        user_features_df=user_features_df,     # Changed parameter name
-        product_features_df=product_features_df,  # Changed parameter name
+        user_features_df=user_features_df,
+        product_features_df=product_features_df,
         mode='val',
         validation_days=validation_days
     )
     
     test_dataset = SheetzDataset(
         interactions_df=self.create_interactions_df(),
-        user_features_df=user_features_df, 
+        user_features_df=user_features_df,
         product_features_df=product_features_df,
         mode='test',
         validation_days=validation_days
     )
+
+    # Create sampler for training
+    train_sampler = ConsistentBatchSampler(
+        dataset_size=len(train_dataset),
+        batch_size=batch_size,
+        shuffle=True
+    )
     
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        collate_fn=collate_recommender_batch  # Add custom collate function
+        collate_fn=collate_recommender_batch
     )
-
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_recommender_batch  # Add custom collate function
-    )    
-
+        collate_fn=collate_recommender_batch
+    )
+    
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
@@ -344,38 +346,57 @@ def create_data_loaders(
         collate_fn=collate_recommender_batch
     )
     
+    logging.info(f"Created train loader with {len(train_loader)} batches")
+    logging.info(f"Created val loader with {len(val_loader)} batches")
+    logging.info(f"Created test loader with {len(test_loader)} batches")
+    
     return train_loader, val_loader, test_loader
 
-class ConsistentBatchSampler(torch.utils.data.Sampler):
-    """Custom batch sampler that ensures consistent batch sizes"""
+class ConsistentBatchSampler:
+    """Ensures consistent batch sizes by padding smaller batches"""
     
-    def __init__(self, dataset_size: int, batch_size: int, shuffle: bool = True, drop_last: bool = False):
+    def __init__(self, dataset_size: int, batch_size: int, shuffle: bool = True):
+        """Initialize sampler with explicit parameters
+        
+        Args:
+            dataset_size: Total number of samples in dataset
+            batch_size: Desired batch size
+            shuffle: Whether to shuffle samples
+        """
         self.dataset_size = dataset_size
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.drop_last = drop_last
         
+        # Calculate batching info
+        self.num_batches = (dataset_size + batch_size - 1) // batch_size
+        self.last_batch_size = dataset_size % batch_size
+        
+        if self.last_batch_size == 0:
+            self.last_batch_size = batch_size
+            
     def __iter__(self):
         # Create index array
         indices = list(range(self.dataset_size))
-        
-        # Shuffle if requested
         if self.shuffle:
             np.random.shuffle(indices)
             
         # Create batches
-        batches = []
-        for idx in range(0, len(indices), self.batch_size):
-            batch = indices[idx:idx + self.batch_size]
-            if len(batch) < self.batch_size and not self.drop_last:
-                # Pad small batches by repeating samples
-                num_missing = self.batch_size - len(batch)
-                batch.extend(batch[:num_missing])
-            batches.append(batch)
+        for i in range(self.num_batches):
+            start_idx = i * self.batch_size
+            end_idx = min(start_idx + self.batch_size, self.dataset_size)
             
-        return iter(batches)
-        
-    def __len__(self):
-        if self.drop_last:
-            return self.dataset_size // self.batch_size
-        return (self.dataset_size + self.batch_size - 1) // self.batch_size
+            # Get batch indices
+            batch_indices = indices[start_idx:end_idx]
+            
+            # Pad last batch if needed
+            if len(batch_indices) < self.batch_size:
+                padding_needed = self.batch_size - len(batch_indices)
+                # Pad with repeated samples from the same batch
+                padding_indices = batch_indices[:padding_needed]
+                batch_indices.extend(padding_indices)
+                
+            yield batch_indices
+            
+    def __len__(self) -> int:
+        """Return the number of batches"""
+        return self.num_batches
