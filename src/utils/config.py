@@ -42,14 +42,25 @@ class ConfigLoader:
     def get_gcp_config(self) -> Dict[str, str]:
         """Get Google Cloud Platform configuration"""
         return self.config['gcp']
-    
+        
     def get_data_generation_config(self) -> Dict[str, Any]:
         """Get data generation configuration"""
-        return self.config['data_generation']
+        return self.config.get('data', {})  # Use 'data' instead of 'data_generation']
     
     def get_model_config(self) -> Dict[str, Any]:
-        """Get model configuration"""
-        return self.config['model']
+        """Get model configuration with type conversion"""
+        config = self.config['model']
+        
+        # Convert numerical parameters
+        if 'ncf' in config:
+            ncf_config = config['ncf']
+            # Convert training parameters to proper types
+            ncf_config['weight_decay'] = float(ncf_config.get('weight_decay', 1e-5))
+            ncf_config['learning_rate'] = float(ncf_config.get('learning_rate', 0.001))
+            ncf_config['batch_size'] = int(ncf_config.get('batch_size', 256))
+            ncf_config['epochs'] = int(ncf_config.get('epochs', 50))
+            
+        return config
     
     def setup_logging(self):
         """Setup logging based on configuration"""

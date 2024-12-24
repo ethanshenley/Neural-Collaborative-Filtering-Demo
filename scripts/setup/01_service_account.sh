@@ -16,11 +16,11 @@ gcloud iam service-accounts create $SA_NAME \
 roles=(
     "roles/aiplatform.user"
     "roles/bigquery.dataViewer"
+    "roles/bigquery.jobUser"  # Add this role
+    "roles/bigquery.user"     # Add this role
     "roles/storage.objectViewer"
-    "roles/storage.objectCreator"
     "roles/monitoring.metricWriter"
     "roles/logging.logWriter"
-    "roles/artifactregistry.reader"
 )
 
 for role in "${roles[@]}"; do

@@ -60,7 +60,7 @@ model:
     
     # Training
     learning_rate: 0.001
-    weight_decay: 1e-5
+    weight_decay: 1e-5  # This might be coming in as a string "1e-5"
     batch_size: 256
     epochs: 50
     validation_days: 10
@@ -92,6 +92,11 @@ model:
       - mrr@10
       - map@10
     eval_batch_size: 512
+
+    # Data parameters (these will be overridden by actual counts)
+    num_products: null  # will be set from data
+    num_users: null    # will be set from data
+    num_negative_samples: 4
 
 # Logging settings
 logging:

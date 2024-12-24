@@ -1,10 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchrec import EmbeddingBagCollection, EmbeddingBagConfig
+
+try:
+    from torchrec import EmbeddingBagCollection, EmbeddingBagConfig
+except ImportError:
+    # Fallback to basic PyTorch for single-GPU training
+    from torch.nn import EmbeddingBag as EmbeddingBagCollection
+    EmbeddingBagConfig = dict
+    
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from typing import Dict, List, Optional, Tuple
 import math
+
+import logging
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.1):
@@ -110,34 +119,45 @@ class CategoryHierarchy(nn.Module):
         return self.norm(hierarchy_embeds + cat_embeds)  # Residual connection
 
 class AdvancedNCF(nn.Module):
-    def __init__(
-        self,
-        num_users: int,
-        num_products: int,
-        num_departments: int,
-        num_categories: int,
-        mf_embedding_dim: int = 64,
-        mlp_embedding_dim: int = 64,
-        temporal_dim: int = 32,
-        mlp_hidden_dims: List[int] = [256, 128, 64],
-        num_heads: int = 4,
-        dropout: float = 0.2,
-        max_sequence_length: int = 50,
-        use_distributed: bool = False
-    ):
+    def __init__(self, 
+                num_users: int,
+                num_products: int,
+                num_departments: int,
+                num_categories: int,
+                mf_embedding_dim: int = 64,
+                mlp_embedding_dim: int = 64,
+                temporal_dim: int = 32,
+                mlp_hidden_dims: List[int] = [256, 128, 64],
+                num_heads: int = 4,
+                dropout: float = 0.2):
         super().__init__()
         
-        # Base embeddings (MF path)
+        # Save all configuration parameters
+        self.num_users = num_users
+        self.num_products = num_products
+        self.num_departments = num_departments
+        self.num_categories = num_categories
+        self.mf_embedding_dim = mf_embedding_dim
+        self.mlp_embedding_dim = mlp_embedding_dim
+        # Layer normalizations for embeddings
+        self.mf_norm = nn.LayerNorm(mf_embedding_dim)
+        self.mlp_norm = nn.LayerNorm(mlp_embedding_dim)
+        self.temporal_dim = temporal_dim
+        self.mlp_hidden_dims = mlp_hidden_dims
+        self.num_heads = num_heads
+        self.dropout = dropout
+        
+        # MF path embeddings
         self.mf_embedding_collection = EmbeddingBagCollection(
             tables=[
                 EmbeddingBagConfig(
-                    name="user_mf_embeddings",
+                    name="user_id",
                     embedding_dim=mf_embedding_dim,
                     num_embeddings=num_users,
                     feature_names=["user_id"]
                 ),
                 EmbeddingBagConfig(
-                    name="product_mf_embeddings",
+                    name="product_id",
                     embedding_dim=mf_embedding_dim,
                     num_embeddings=num_products,
                     feature_names=["product_id"]
@@ -145,17 +165,17 @@ class AdvancedNCF(nn.Module):
             ]
         )
         
-        # Neural path embeddings
+        # MLP path embeddings
         self.mlp_embedding_collection = EmbeddingBagCollection(
             tables=[
                 EmbeddingBagConfig(
-                    name="user_mlp_embeddings",
+                    name="user_id",
                     embedding_dim=mlp_embedding_dim,
                     num_embeddings=num_users,
                     feature_names=["user_id"]
                 ),
                 EmbeddingBagConfig(
-                    name="product_mlp_embeddings",
+                    name="product_id",
                     embedding_dim=mlp_embedding_dim,
                     num_embeddings=num_products,
                     feature_names=["product_id"]
@@ -187,30 +207,28 @@ class AdvancedNCF(nn.Module):
             dropout=dropout
         )
         
-        # Feature combination network
+        # Initialize neural network layers with proper shapes
         combined_dim = (
-            mf_embedding_dim +  # MF path
-            mlp_embedding_dim +  # MLP path
-            mlp_embedding_dim +  # Category hierarchy
-            temporal_dim        # Temporal features
+            mlp_embedding_dim +    # From user-product attention
+            temporal_dim          # From temporal features
         )
         
         self.feature_combination = nn.Sequential(
             nn.Linear(combined_dim, mlp_hidden_dims[0]),
             nn.ReLU(),
-            nn.BatchNorm1d(mlp_hidden_dims[0]),
+            nn.LayerNorm(mlp_hidden_dims[0]),  # Changed from BatchNorm1d
             nn.Dropout(dropout)
-        )
-        
+        )     
+
         # Main MLP
         layers = []
         input_dim = mlp_hidden_dims[0]
-        
+
         for hidden_dim in mlp_hidden_dims[1:]:
             layers.extend([
                 nn.Linear(input_dim, hidden_dim),
                 nn.ReLU(),
-                nn.BatchNorm1d(hidden_dim),
+                nn.LayerNorm(hidden_dim),  # Changed from BatchNorm1d
                 nn.Dropout(dropout)
             ])
             input_dim = hidden_dim
@@ -231,71 +249,65 @@ class AdvancedNCF(nn.Module):
         self.mf_norm = nn.LayerNorm(mf_embedding_dim)
         self.mlp_norm = nn.LayerNorm(mlp_embedding_dim)
         
-    def forward(self, features: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # Extract features
-        user_features = features["user_features"]
-        product_features = features["product_features"]
-        temporal_features = features["temporal_features"]
-        category_features = features["category_features"]
-        sequence_features = features.get("sequence_features")  # Optional
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        """Forward pass of the NCF model.
         
-        # Get base embeddings
-        mf_embeddings = self.mf_embedding_collection(user_features)
-        mlp_embeddings = self.mlp_embedding_collection(product_features)
+        Args:
+            features: KeyedJaggedTensor containing user and product ids
+            
+        Returns:
+            Tensor of shape [B, 1] containing prediction scores
+        """
+        # Get embeddings from collections
+        mf_embeddings = self.mf_embedding_collection(features)
+        mlp_embeddings = self.mlp_embedding_collection(features)
         
-        # Apply layer norms
-        user_mf = self.mf_norm(mf_embeddings["user_id"])
+        # Get batch size from embeddings correctly
+        batch_size = mf_embeddings["user_id"].size(0)
+        
+        # Add batch size logging/checking
+        if batch_size < 2:
+            logging.warning(f"Small batch detected: {batch_size}")
+        
+        # Get embeddings and apply layer norm
+        user_mf = self.mf_norm(mf_embeddings["user_id"])  
         product_mf = self.mf_norm(mf_embeddings["product_id"])
         user_mlp = self.mlp_norm(mlp_embeddings["user_id"])
         product_mlp = self.mlp_norm(mlp_embeddings["product_id"])
-        
+
         # Matrix Factorization path
-        mf_vector = user_mf * product_mf
-        mf_pred = self.mf_output(mf_vector)
+        mf_vector = user_mf * product_mf  # [B, embed_dim]
+        mf_pred = self.mf_output(mf_vector)  # [B, 1]
         
         # Neural Network path with attention
+        user_mlp = user_mlp.unsqueeze(1)  # [B, 1, embed_dim]
+        product_mlp = product_mlp.unsqueeze(1)  # [B, 1, embed_dim]
+        
+        # Apply attention
         user_product_attn = self.user_product_attention(
             user_mlp, product_mlp, product_mlp
-        )
+        ).squeeze(1)  # [B, embed_dim]
         
-        # Add sequence attention if available
-        if sequence_features is not None:
-            sequence_attn = self.sequence_attention(
-                user_product_attn, sequence_features, sequence_features
-            )
-            user_product_attn = user_product_attn + sequence_attn
-            
-        # Get category hierarchy embeddings
-        category_embeds = self.category_hierarchy(
-            category_features["department_ids"],
-            category_features["category_ids"]
-        )
+        # Create temporal embeddings
+        temporal_embeds = torch.zeros(
+            batch_size, self.temporal_dim, 
+            device=user_mf.device
+        )  # [B, temporal_dim]
         
-        # Get temporal embeddings
-        temporal_embeds = self.temporal_encoding(
-            temporal_features["hour"],
-            temporal_features["day"],
-            temporal_features["month"],
-            temporal_features["days_since"]
-        )
-        
-        # Combine all features
+        # Combine features
         combined_features = torch.cat([
-            user_product_attn,
-            category_embeds,
-            temporal_embeds
-        ], dim=-1)
+            user_product_attn,  # [B, embed_dim]
+            temporal_embeds,    # [B, temporal_dim]
+        ], dim=1)  # [B, embed_dim + temporal_dim]
         
-        # Pass through feature combination network
-        combined = self.feature_combination(combined_features)
-        
-        # Pass through main MLP
-        mlp_vector = self.mlp(combined)
-        mlp_pred = self.mlp_output(mlp_vector)
+        # Pass through MLP
+        combined = self.feature_combination(combined_features)  # [B, hidden_dim]
+        mlp_vector = self.mlp(combined)  # [B, hidden_dim]
+        mlp_pred = self.mlp_output(mlp_vector)  # [B, 1]
         
         # Final prediction
-        final_pred = torch.cat([mf_pred, mlp_pred], dim=-1)
-        return self.final(final_pred)
+        final_pred = torch.cat([mf_pred, mlp_pred], dim=1)  # [B, 2]
+        return self.final(final_pred)  # [B, 1]
         
     def get_user_embeddings(self, user_features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Get user embeddings for efficient inference"""

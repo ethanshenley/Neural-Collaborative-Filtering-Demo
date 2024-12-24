@@ -5,12 +5,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
-from typing import Dict, Any, List
-import logging
+from torchrec import KeyedJaggedTensor
+from typing import Dict, Any, List, Tuple
+import pandas as pd
 from tqdm import tqdm
-
+from src.model.data_prep import SheetzDataset, create_data_loaders, collate_recommender_batch, ConsistentBatchSampler
 from src.utils.metrics import calculate_metrics
 from src.data.negative_sampler import NegativeSampler
+
+from google.api_core import retry, exceptions
+from google.cloud import bigquery
+import logging
 
 class ModelTrainer:
     def __init__(
@@ -19,75 +24,249 @@ class ModelTrainer:
         config: Dict[str, Any],
         num_gpus: int
     ):
+        
+         # Required configuration parameters
+        required_params = {
+            'num_users',
+            'num_products',
+            'batch_size',
+            'learning_rate',
+            'project_id',
+            'dataset_id'
+        }
+
+        missing_params = required_params - set(config.keys())
+        if missing_params:
+            raise ValueError(f"Missing required parameters in config: {missing_params}")
+       
+        self.model = model
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_gpus = num_gpus
+        self.negative_samples = config.get('negative_samples', 4)
+        self.logger = logging.getLogger(__name__)
         
-        # Initialize distributed model if using multiple GPUs
-        if num_gpus > 1:
-            planner = EmbeddingShardingPlanner(
-                topology=Topology(world_size=num_gpus),
-                batch_size=config["batch_size"],
-            )
-            
-            self.model = DistributedModelParallel(
-                module=model,
-                plan=planner.plan(model),
-            )
-        else:
-            self.model = model.to(self.device)
+        weight_decay = float(config.get('weight_decay', 1e-5))  # Explicit conversion to float
         
-        # Initialize optimizer and loss
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=config["learning_rate"]
-        )
-        self.criterion = nn.BCELoss()
+        # Validate required configuration
+        required_params = {'num_products', 'num_users', 'batch_size', 'learning_rate'}
+        missing_params = required_params - set(config.keys())
+        if missing_params:
+            raise ValueError(f"Missing required parameters in config: {missing_params}")
         
         # Initialize negative sampler
         self.negative_sampler = NegativeSampler(
-            num_products=config["num_products"],
-            num_negative=config["num_negative_samples"]
+            num_products=config['num_products'],
+            num_negative=config.get('num_negative_samples', 4)
         )
         
-        # Setup logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+        # Initialize optimizer
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=config['learning_rate'],
+            weight_decay=weight_decay
+        )
+        
+        # Move model to appropriate device
+        if num_gpus > 1:
+            self.model = DistributedModelParallel(
+                module=self.model,
+                device_ids=list(range(num_gpus))
+            )
+        else:
+            self.model = self.model.to(self.device)
+
+        # Log configuration for debugging
+        logging.info("Initializing ModelTrainer with config:")
+        for key, value in config.items():
+            logging.info(f"  {key}: {value}")
+
+    def create_data_loaders(
+        self,
+        user_features_df: pd.DataFrame,
+        product_features_df: pd.DataFrame,
+        batch_size: int = 256,
+        num_workers: int = 4,
+        validation_days: int = 10
+    ) -> Tuple[DataLoader, DataLoader]:
+        """Create training and validation data loaders
+        
+        Args:
+            user_features_df: DataFrame with user features
+            product_features_df: DataFrame with product features
+            batch_size: Batch size for training
+            num_workers: Number of worker processes
+            validation_days: Number of days to use for validation
+            
+        Returns:
+            Tuple of (train_loader, val_loader)
+        """
+        logging.info("Creating data loaders...")
+        
+        # Create datasets
+        train_dataset = SheetzDataset(
+            interactions_df=self.create_interactions_df(),
+            user_features_df=user_features_df,
+            product_features_df=product_features_df,
+            mode='train',
+            validation_days=validation_days,
+            negative_samples=self.config.get('negative_samples', 4)
+        )
+        
+        val_dataset = SheetzDataset(
+            interactions_df=self.create_interactions_df(),
+            user_features_df=user_features_df,
+            product_features_df=product_features_df,
+            mode='val',
+            validation_days=validation_days
+        )
+        
+        # Create samplers
+        train_sampler = ConsistentBatchSampler(
+            dataset_size=len(train_dataset),
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False
+        )
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=collate_recommender_batch,
+            batch_sampler=train_sampler
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_recommender_batch
+        )
+        
+        logging.info(f"Created train loader with {len(train_loader)} batches")
+        logging.info(f"Created val loader with {len(val_loader)} batches")
+        
+        # Verify batch sizes
+        for i, (features, targets) in enumerate(train_loader):
+            batch_size = features.size(0)
+            if batch_size < 2:
+                logging.warning(f"Small batch detected in train loader: {batch_size}")
+            if i == 0:
+                logging.info(f"First batch size: {batch_size}")
+            if i >= 5:  # Check first few batches
+                break
+                
+        return train_loader, val_loader
+
+    @staticmethod
+    def collate_recommender_batch(batch):
+        """Custom collate function for batching KeyedJaggedTensor samples"""
+        features_list = []
+        targets_list = []
+        
+        for features, targets in batch:
+            features_list.append(features)
+            targets_list.append(targets)
+            
+        # Concatenate KeyedJaggedTensors
+        batched_features = KeyedJaggedTensor.concat(features_list)
+        batched_targets = torch.cat(targets_list)
+        
+        return batched_features, batched_targets
     
+    @retry.Retry(
+        initial=1.0,
+        maximum=60.0,
+        multiplier=2.0,
+        predicate=retry.if_exception_type(
+            (exceptions.ServerError,
+             exceptions.Forbidden,
+             exceptions.ServiceUnavailable)
+        )
+    )
+
+    def _execute_bigquery(self, query: str) -> pd.DataFrame:
+        """Execute BigQuery with retry logic"""
+        client = bigquery.Client(project=self.config['project_id'])
+        return client.query(query).to_dataframe()
+
+    def create_interactions_df(self):
+        """Create interaction data from transaction facts"""
+        query = """
+        SELECT
+            thf.cust_code as user_id,
+            tbf.inventory_code as product_id,
+            tbf.extended_retail as amount,
+            thf.physical_date_time as transaction_timestamp
+        FROM `{project_id}.{dataset_id}.transaction_header_fact` thf
+        JOIN `{project_id}.{dataset_id}.transaction_body_fact` tbf
+            ON thf.store_number = tbf.store_number
+            AND thf.transaction_number = tbf.transaction_number
+        WHERE thf.cust_code IS NOT NULL
+        ORDER BY thf.physical_date_time DESC
+        """.format(
+            project_id=self.config['project_id'],
+            dataset_id=self.config['dataset_id']
+        )
+        
+        try:
+            df = self._execute_bigquery(query)
+            logging.info(f"Successfully loaded {len(df)} interactions")
+            return df
+        except Exception as e:
+            logging.error(f"Failed to load interactions after retries: {str(e)}")
+            raise
+
     def train_epoch(self, train_loader: DataLoader) -> float:
-        """Train for one epoch."""
+        """Train for one epoch"""
         self.model.train()
         total_loss = 0
+        num_batches = 0
         
         with tqdm(train_loader, desc="Training") as pbar:
             for batch_idx, (features, targets) in enumerate(pbar):
-                # Generate negative samples
-                neg_features, neg_targets = self.negative_sampler.sample(
-                    features, targets
-                )
-                
-                # Combine positive and negative samples
-                all_features = features.concat(neg_features)
-                all_targets = torch.cat([targets, neg_targets])
+                # Check batch size using KeyedJaggedTensor methods
+                batch_size = len(features.values()) // len(features.keys())
+                if batch_size < 2:
+                    logging.warning(f"Small batch detected: {batch_size}")
+                    continue
+                    
+                # Move to device
+                features = features.to(self.device)
+                targets = targets.to(self.device)
                 
                 # Forward pass
-                outputs = self.model(all_features)
-                loss = self.criterion(outputs, all_targets)
-                
+                try:
+                    outputs = self.model(features)
+                    loss = self.criterion(outputs, targets)
+                except Exception as e:
+                    logging.error(f"Error in forward pass: {str(e)}")
+                    logging.error(f"Batch size: {batch_size}")
+                    logging.error(f"Feature keys: {features.keys()}")
+                    raise
+                    
+                # Rest of training logic...                    
                 # Backward pass
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
                 
-                # Update progress bar
+                # Update metrics
                 total_loss += loss.item()
+                num_batches += 1
+                
+                # Update progress bar
                 pbar.set_postfix({
                     'loss': f'{loss.item():.4f}',
-                    'avg_loss': f'{total_loss/(batch_idx+1):.4f}'
+                    'avg_loss': f'{total_loss/num_batches:.4f}',
+                    'batch_size': features.size(0)
                 })
-        
-        return total_loss / len(train_loader)
-    
+                
+        return total_loss / num_batches if num_batches > 0 else float('inf')
+      
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """Validate the model."""
         self.model.eval()

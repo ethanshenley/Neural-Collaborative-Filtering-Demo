@@ -30,10 +30,13 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     google-cloud-bigquery>=3.17.1 \
     google-cloud-storage>=2.14.0 \
+    google-cloud-bigquery[bqstorage,pandas] \
+    pandas-gbq>=0.20.0 \ 
     pyyaml>=6.0.1 \
     pandas \
     numpy \
-    tqdm
+    tqdm \
+    db-dtypes
 
 # Verify CUDA setup
 RUN python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
@@ -43,24 +46,39 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=${CUDA_HOME}/bin:${PATH}
 ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 
-# Add and verify setup script
-COPY verify_setup.py /verify_setup.py
-RUN python /verify_setup.py
-
 # Set working directory
 WORKDIR /app
 
-# Copy application files
-COPY setup.py /app/
-COPY requirements.txt /app/
-COPY src/ /app/src/
+# Copy configuration first to verify it
 COPY config/ /app/config/
+
+# Verify config.yaml exists and can be loaded
+RUN python -c "import yaml, os; \
+    config_path = '/app/config/config.yaml'; \
+    assert os.path.exists(config_path), f'Config not found at {config_path}'; \
+    config = yaml.safe_load(open(config_path)); \
+    assert 'data' in config, 'data section missing in config'; \
+    assert 'model' in config, 'model section missing in config'; \
+    assert 'gcp' in config, 'gcp section missing in config'; \
+    print('Config validation successful')"
+
+# Copy remaining application files
+COPY setup.py requirements.txt ./
+COPY src/ /app/src/
 
 # Install the package in editable mode
 RUN pip install -e .
 
-# Verify `train.py` exists and inspect its first 20 lines
-RUN echo "Verifying train.py version:" && head -n 20 /app/src/train.py
+# Verify complete setup
+COPY verify_setup.py ./
+RUN python verify_setup.py
 
-# Entry point (optional, for local testing)
+# Verify train.py and check structure
+RUN python -c "import os; \
+    assert os.path.exists('/app/src/train.py'), 'train.py not found'; \
+    from src.utils.config import ConfigLoader; \
+    from src.model.architecture import AdvancedNCF; \
+    print('All critical modules imported successfully')"
+
+# Set default command
 CMD ["python", "-m", "src.train"]

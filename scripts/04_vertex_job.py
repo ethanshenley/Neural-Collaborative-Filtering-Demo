@@ -24,25 +24,28 @@ def submit_training_job():
         # Worker pool specification with simplified configuration
         worker_pool_specs = [{
             "machine_spec": {
-                "machine_type": "n1-standard-4",
+                "machine_type": "n1-standard-8",
                 "accelerator_type": "NVIDIA_TESLA_T4",
                 "accelerator_count": 1
             },
             "replica_count": 1,
             "container_spec": {
-                "image_uri": "gcr.io/sheetz-poc/recommender-training:latest",
+                "image_uri": "us-central1-docker.pkg.dev/sheetz-poc/sheetz-training/recommender-training:latest",
                 "command": ["python", "-m", "src.train"],
                 "env": [
-                    {"name": "GOOGLE_CLOUD_PROJECT", "value": "sheetz-poc"}
+                    {"name": "PYTORCH_CUDA_ALLOC_CONF", "value": "max_split_size_mb:512"},
+                    {"name": "NCCL_DEBUG", "value": "INFO"},
+                    {"name": "GOOGLE_CLOUD_PROJECT", "value": "sheetz-poc"} # Add project ID
                 ]
-            }
+            },
+            "python_package_spec": None
         }]
 
-        # Create custom job
+        # Add service account configuration
         job = aiplatform.CustomJob(
             display_name=job_name,
             worker_pool_specs=worker_pool_specs,
-            base_output_dir=f'gs://sheetz-training-artifacts/jobs/{job_name}'
+            base_output_dir=f'gs://sheetz-training-artifacts/jobs/{job_name}',
         )
 
         logger.info("Starting job execution...")
@@ -50,7 +53,7 @@ def submit_training_job():
         # Run job with simpler configuration
         job.run(
             sync=True,
-            service_account="compute-engine-sa@sheetz-poc.iam.gserviceaccount.com"
+            service_account=f"vertex-training@sheetz-poc.iam.gserviceaccount.com"  # Add service account
         )
 
         logger.info(f"Job completed with state: {job.state}")
