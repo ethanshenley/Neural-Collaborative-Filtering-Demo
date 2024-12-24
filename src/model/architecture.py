@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from torchrec import EmbeddingBagCollection, EmbeddingBagConfig
+    from torchrec import EmbeddingBagCollection, EmbeddingBagConfig, PoolingType
 except ImportError:
     # Fallback to basic PyTorch for single-GPU training
     from torch.nn import EmbeddingBag as EmbeddingBagCollection
@@ -129,7 +129,8 @@ class AdvancedNCF(nn.Module):
                 temporal_dim: int = 32,
                 mlp_hidden_dims: List[int] = [256, 128, 64],
                 num_heads: int = 4,
-                dropout: float = 0.2):
+                dropout: float = 0.2,
+                negative_samples: int = 4):  # Add negative_samples parameter
         super().__init__()
         
         # Save all configuration parameters
@@ -146,6 +147,7 @@ class AdvancedNCF(nn.Module):
         self.mlp_hidden_dims = mlp_hidden_dims
         self.num_heads = num_heads
         self.dropout = dropout
+        self.negative_samples = negative_samples  # Store as instance attribute
         
         # MF path embeddings
         self.mf_embedding_collection = EmbeddingBagCollection(
@@ -154,13 +156,15 @@ class AdvancedNCF(nn.Module):
                     name="user_id",
                     embedding_dim=mf_embedding_dim,
                     num_embeddings=num_users,
-                    feature_names=["user_id"]
+                    feature_names=["user_id"],
+                    pooling=PoolingType.SUM
                 ),
                 EmbeddingBagConfig(
                     name="product_id",
                     embedding_dim=mf_embedding_dim,
                     num_embeddings=num_products,
-                    feature_names=["product_id"]
+                    feature_names=["product_id"],
+                    pooling=PoolingType.SUM
                 )
             ]
         )
@@ -172,13 +176,15 @@ class AdvancedNCF(nn.Module):
                     name="user_id",
                     embedding_dim=mlp_embedding_dim,
                     num_embeddings=num_users,
-                    feature_names=["user_id"]
+                    feature_names=["user_id"],
+                    pooling=PoolingType.SUM
                 ),
                 EmbeddingBagConfig(
                     name="product_id",
                     embedding_dim=mlp_embedding_dim,
                     num_embeddings=num_products,
-                    feature_names=["product_id"]
+                    feature_names=["product_id"],
+                    pooling=PoolingType.SUM
                 )
             ]
         )
@@ -221,19 +227,19 @@ class AdvancedNCF(nn.Module):
         )     
 
         # Main MLP
-        layers = []
-        input_dim = mlp_hidden_dims[0]
+        mlp_layers = []
+        current_dim = combined_dim  # Start with combined input dimension
 
-        for hidden_dim in mlp_hidden_dims[1:]:
-            layers.extend([
-                nn.Linear(input_dim, hidden_dim),
+        for hidden_dim in mlp_hidden_dims:
+            mlp_layers.extend([
+                nn.Linear(current_dim, hidden_dim),
                 nn.ReLU(),
-                nn.LayerNorm(hidden_dim),  # Changed from BatchNorm1d
+                nn.LayerNorm(hidden_dim),
                 nn.Dropout(dropout)
             ])
-            input_dim = hidden_dim
-            
-        self.mlp = nn.Sequential(*layers)
+            current_dim = hidden_dim
+        
+        self.mlp = nn.Sequential(*mlp_layers)
         
         # Output layers
         self.mf_output = nn.Linear(mf_embedding_dim, 1)
@@ -250,65 +256,130 @@ class AdvancedNCF(nn.Module):
         self.mlp_norm = nn.LayerNorm(mlp_embedding_dim)
         
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
-        """Forward pass of the NCF model.
+        """Forward pass with robust batch handling and shape validation.
         
         Args:
-            features: KeyedJaggedTensor containing user and product ids
+            features: KeyedJaggedTensor containing user_id and product_id features
+                     Shape: (batch_size * (1 + negative_samples))
             
         Returns:
-            Tensor of shape [B, 1] containing prediction scores
+            Tensor of prediction scores
+            Shape: (batch_size * (1 + negative_samples), 1)
+            
+        Raises:
+            ValueError: If tensor shapes are inconsistent
         """
-        # Get embeddings from collections
-        mf_embeddings = self.mf_embedding_collection(features)
-        mlp_embeddings = self.mlp_embedding_collection(features)
-        
-        # Get batch size from embeddings correctly
-        batch_size = mf_embeddings["user_id"].size(0)
-        
-        # Add batch size logging/checking
-        if batch_size < 2:
-            logging.warning(f"Small batch detected: {batch_size}")
-        
-        # Get embeddings and apply layer norm
-        user_mf = self.mf_norm(mf_embeddings["user_id"])  
-        product_mf = self.mf_norm(mf_embeddings["product_id"])
-        user_mlp = self.mlp_norm(mlp_embeddings["user_id"])
-        product_mlp = self.mlp_norm(mlp_embeddings["product_id"])
-
-        # Matrix Factorization path
-        mf_vector = user_mf * product_mf  # [B, embed_dim]
-        mf_pred = self.mf_output(mf_vector)  # [B, 1]
-        
-        # Neural Network path with attention
-        user_mlp = user_mlp.unsqueeze(1)  # [B, 1, embed_dim]
-        product_mlp = product_mlp.unsqueeze(1)  # [B, 1, embed_dim]
-        
-        # Apply attention
-        user_product_attn = self.user_product_attention(
-            user_mlp, product_mlp, product_mlp
-        ).squeeze(1)  # [B, embed_dim]
-        
-        # Create temporal embeddings
-        temporal_embeds = torch.zeros(
-            batch_size, self.temporal_dim, 
-            device=user_mf.device
-        )  # [B, temporal_dim]
-        
-        # Combine features
-        combined_features = torch.cat([
-            user_product_attn,  # [B, embed_dim]
-            temporal_embeds,    # [B, temporal_dim]
-        ], dim=1)  # [B, embed_dim + temporal_dim]
-        
-        # Pass through MLP
-        combined = self.feature_combination(combined_features)  # [B, hidden_dim]
-        mlp_vector = self.mlp(combined)  # [B, hidden_dim]
-        mlp_pred = self.mlp_output(mlp_vector)  # [B, 1]
-        
-        # Final prediction
-        final_pred = torch.cat([mf_pred, mlp_pred], dim=1)  # [B, 2]
-        return self.final(final_pred)  # [B, 1]
-        
+        try:
+            # Calculate batch dimensions
+            total_samples = features.values().size(0) // 2  # Divide by 2 because we have user_id and product_id
+            samples_per_interaction = 1 + self.negative_samples if self.training else 1
+            batch_size = total_samples // samples_per_interaction
+            
+            # Log shape information
+            logging.debug(f"Forward pass dimensions:")
+            logging.debug(f"- Total samples: {total_samples}")
+            logging.debug(f"- Batch size: {batch_size}")
+            logging.debug(f"- Samples per interaction: {samples_per_interaction}")
+            
+            # Get embeddings with validation
+            try:
+                mf_embeddings = self.mf_embedding_collection(features)
+                mlp_embeddings = self.mlp_embedding_collection(features)
+            except Exception as e:
+                logging.error("Failed to get embeddings:")
+                logging.error(f"Feature values shape: {features.values().shape}")
+                logging.error(f"Feature lengths: {features.lengths()}")
+                raise
+            
+            # Validate embedding shapes
+            for path, embeddings in [("MF", mf_embeddings), ("MLP", mlp_embeddings)]:
+                for key in embeddings.keys():
+                    tensor = embeddings[key]
+                    if tensor.size(0) != total_samples:
+                        raise ValueError(
+                            f"{path} {key} embedding shape mismatch: "
+                            f"got {tensor.size(0)}, expected {total_samples}"
+                        )
+            
+            # Process MF path
+            user_mf = self.mf_norm(mf_embeddings["user_id"])  # [batch_size * samples_per_interaction, embed_dim]
+            product_mf = self.mf_norm(mf_embeddings["product_id"])
+            mf_vector = user_mf * product_mf  # Element-wise multiplication
+            mf_pred = self.mf_output(mf_vector)  # [batch_size * samples_per_interaction, 1]
+            
+            # Process MLP path with attention
+            user_mlp = self.mlp_norm(mlp_embeddings["user_id"])  
+            product_mlp = self.mlp_norm(mlp_embeddings["product_id"])
+            
+            # Reshape for attention
+            user_mlp = user_mlp.view(batch_size, samples_per_interaction, -1)
+            product_mlp = product_mlp.view(batch_size, samples_per_interaction, -1)
+            
+            # Apply attention across samples for each batch
+            user_product_attn = self.user_product_attention(
+                user_mlp,  # [batch_size, samples_per_interaction, embed_dim]
+                product_mlp,
+                product_mlp
+            )  # [batch_size, samples_per_interaction, embed_dim]
+            
+            # Reshape attention output
+            user_product_attn = user_product_attn.view(total_samples, -1)
+            
+            # Create temporal features
+            temporal_embeds = torch.zeros(
+                total_samples, 
+                self.temporal_dim,
+                device=user_mf.device,
+                dtype=user_mf.dtype
+            )
+            
+            # Combine features for MLP
+            combined_features = torch.cat([
+                user_product_attn,
+                temporal_embeds
+            ], dim=1)
+            
+            # Process through MLP layers
+            try:
+                mlp_vector = self.mlp(combined_features)  # [total_samples, mlp_hidden_dims[-1]]
+                mlp_pred = self.mlp_output(mlp_vector)    # [total_samples, 1]
+            except Exception as e:
+                logging.error("Error in MLP processing:")
+                logging.error(f"Combined features shape: {combined_features.shape}")
+                logging.error(f"MLP hidden dims: {self.mlp_hidden_dims}")
+                raise
+            
+            # Combine predictions
+            combined = torch.cat([mf_pred, mlp_pred], dim=1)  # [total_samples, 2]
+            outputs = self.final(combined)  # [total_samples, 1]
+            
+            # Final validation
+            expected_shape = (total_samples, 1)
+            if outputs.shape != expected_shape:
+                raise ValueError(
+                    f"Output shape mismatch: got {outputs.shape}, "
+                    f"expected {expected_shape}"
+                )
+                
+            # Add debugging info for first forward pass
+            if not hasattr(self, '_first_forward_done'):
+                logging.info(f"First forward pass shapes:")
+                logging.info(f"- User MF: {user_mf.shape}")
+                logging.info(f"- Product MF: {product_mf.shape}")
+                logging.info(f"- User-Product Attention: {user_product_attn.shape}")
+                logging.info(f"- MLP Vector: {mlp_vector.shape}")
+                logging.info(f"- Final Output: {outputs.shape}")
+                self._first_forward_done = True
+            
+            return outputs
+            
+        except Exception as e:
+            logging.error("Error in model forward pass:")
+            logging.error(f"Input features: {features}")
+            logging.error(f"Training mode: {self.training}")
+            logging.error(f"Error details: {str(e)}")
+            raise
+            
     def get_user_embeddings(self, user_features: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Get user embeddings for efficient inference"""
         mf_embeddings = self.mf_embedding_collection(user_features["user_features"])

@@ -60,7 +60,8 @@ def initialize_model(
             temporal_dim=model_config.get('temporal_dim', 32),
             mlp_hidden_dims=model_config['layers'],
             num_heads=model_config['num_heads'],
-            dropout=model_config['dropout']
+            dropout=model_config['dropout'],
+            negative_samples=model_config.get('negative_samples', 4)  # Add this line
         )
         return model
     except Exception as e:

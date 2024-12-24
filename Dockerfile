@@ -36,7 +36,8 @@ RUN pip install --no-cache-dir \
     pandas \
     numpy \
     tqdm \
-    db-dtypes
+    db-dtypes \
+    scikit-learn
 
 # Verify CUDA setup
 RUN python -c "import torch; print('CUDA available:', torch.cuda.is_available())"

@@ -1,122 +1,204 @@
-# src/utils/metrics.py
-
 import torch
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Union, Optional
+from collections import defaultdict
+from sklearn import metrics
 
-def calculate_hit_rate(predictions: torch.Tensor, targets: torch.Tensor, k: int = 10) -> float:
-    """
-    Calculate Hit Rate @ K
-    Args:
-        predictions: Predicted scores (B, N)
-        targets: Binary target values (B, N)
-        k: Number of items to consider
-    Returns:
-        Hit Rate @ K
-    """
-    # Get top K item indices
-    _, top_indices = torch.topk(predictions, k, dim=1)
-    
-    # Check if any target item is in top K
-    target_indices = torch.nonzero(targets, as_tuple=True)[1]
-    hits = [(target in top_k) for target, top_k in zip(target_indices, top_indices)]
-    
-    return torch.tensor(hits).float().mean().item()
+import logging
 
-def calculate_ndcg(predictions: torch.Tensor, targets: torch.Tensor, k: int = 10) -> float:
-    """
-    Calculate Normalized Discounted Cumulative Gain @ K
+def calculate_metrics(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    k_values: List[int] = [1, 5, 10],
+    batch_size: Optional[int] = None
+) -> Dict[str, float]:
+    """Calculate all recommendation metrics comprehensively.
+    
     Args:
-        predictions: Predicted scores (B, N)
-        targets: Binary target values (B, N)
-        k: Number of items to consider
+        predictions: Model prediction scores (N, 1)
+        targets: Ground truth values (N, 1)
+        k_values: List of k values for cut-off metrics
+        batch_size: Original batch size for reshaping (before negative sampling)
+        
     Returns:
-        NDCG @ K
+        Dictionary containing all metrics
     """
-    # Get top K item indices
-    _, top_indices = torch.topk(predictions, k, dim=1)
+    try:
+        # Ensure tensors are on CPU and correct shape
+        predictions = predictions.detach().cpu()
+        targets = targets.detach().cpu()
+        
+        if predictions.dim() == 2:
+            predictions = predictions.squeeze(1)
+        if targets.dim() == 2:
+            targets = targets.squeeze(1)
+            
+        # If batch_size not provided, try to infer it
+        if batch_size is None:
+            # Assume first occurrence of target 1 starts a new batch
+            target_ones = (targets == 1).nonzero().squeeze()
+            if len(target_ones) > 1:
+                batch_size = target_ones[1] - target_ones[0]
+            else:
+                batch_size = len(targets)
+        
+        # Initialize metrics dictionary
+        metrics = defaultdict(float)
+        
+        # Calculate metrics for each k
+        for k in k_values:
+            # Basic metrics
+            metrics[f'hit_rate@{k}'] = calculate_hit_rate(predictions, targets, k, batch_size)
+            metrics[f'ndcg@{k}'] = calculate_ndcg(predictions, targets, k, batch_size)
+            metrics[f'mrr@{k}'] = calculate_mrr(predictions, targets, k, batch_size)
+            metrics[f'map@{k}'] = calculate_map(predictions, targets, k, batch_size)
+        
+        # Additional metrics
+        metrics['auc'] = calculate_auc(predictions, targets)
+        metrics['accuracy'] = calculate_accuracy(predictions, targets)
+        
+        # Separate positive/negative metrics
+        pos_mask = targets == 1
+        neg_mask = targets == 0
+        
+        if pos_mask.any():
+            metrics['pos_accuracy'] = calculate_accuracy(predictions[pos_mask], targets[pos_mask])
+        if neg_mask.any():
+            metrics['neg_accuracy'] = calculate_accuracy(predictions[neg_mask], targets[neg_mask])
+        
+        return dict(metrics)  # Convert defaultdict to regular dict
+        
+    except Exception as e:
+        logging.error("Error calculating metrics:")
+        logging.error(f"Predictions shape: {predictions.shape}")
+        logging.error(f"Targets shape: {targets.shape}")
+        logging.error(f"Error details: {str(e)}")
+        raise
+
+def calculate_hit_rate(preds: torch.Tensor, targets: torch.Tensor, k: int, batch_size: int) -> float:
+    """Calculate Hit Rate @ K for batched predictions.
+    
+    A hit occurs when the positive item appears in the top-k predictions.
+    """
+    # Reshape into batches
+    preds = preds.view(-1, batch_size)
+    targets = targets.view(-1, batch_size)
+    
+    # Get top K indices
+    _, top_indices = torch.topk(preds, k=min(k, preds.size(1)), dim=1)
+    
+    # Create mask of positive items
+    target_mask = targets == 1
+    
+    # Check if positive items are in top K
+    hits = torch.zeros(preds.size(0), dtype=torch.bool)
+    for i in range(preds.size(0)):
+        hits[i] = target_mask[i, top_indices[i]].any()
+    
+    return hits.float().mean().item()
+
+def calculate_ndcg(preds: torch.Tensor, targets: torch.Tensor, k: int, batch_size: int) -> float:
+    """Calculate Normalized Discounted Cumulative Gain @ K.
+    
+    NDCG measures the quality of ranking considering position importance.
+    """
+    # Reshape into batches
+    preds = preds.view(-1, batch_size)
+    targets = targets.view(-1, batch_size)
+    
+    # Get top K indices
+    _, indices = torch.topk(preds, k=min(k, preds.size(1)), dim=1)
     
     # Calculate DCG
-    dcg = torch.zeros(len(predictions))
-    for i, (top_k, target) in enumerate(zip(top_indices, targets)):
-        relevance = target[top_k]
-        position_discount = 1 / torch.log2(torch.arange(len(top_k), device=predictions.device) + 2)
-        dcg[i] = (relevance * position_discount).sum()
+    positions = torch.arange(1, indices.size(1) + 1, dtype=torch.float32)
+    weights = 1 / torch.log2(positions + 1)
+    
+    dcg = torch.zeros(preds.size(0))
+    for i in range(preds.size(0)):
+        relevant_items = targets[i, indices[i]]
+        dcg[i] = (relevant_items * weights).sum()
     
     # Calculate ideal DCG
-    ideal_dcg = torch.zeros(len(predictions))
-    target_indices = torch.nonzero(targets, as_tuple=True)[1]
-    position_discount = 1 / torch.log2(torch.arange(1, k + 1, device=predictions.device) + 1)
-    ideal_dcg = position_discount.sum()
+    ideal_dcg = torch.zeros(preds.size(0))
+    ideal_relevant = torch.ones(min(k, int(targets.sum(dim=1).max().item())))
+    if len(ideal_relevant) > 0:
+        ideal_dcg += (ideal_relevant * weights[:len(ideal_relevant)]).sum()
     
-    return (dcg / ideal_dcg).mean().item()
+    # Calculate NDCG
+    ndcg = dcg / ideal_dcg.clamp(min=1e-8)  # Avoid division by zero
+    return ndcg.mean().item()
 
-def calculate_mrr(predictions: torch.Tensor, targets: torch.Tensor, k: int = 10) -> float:
-    """
-    Calculate Mean Reciprocal Rank @ K
-    Args:
-        predictions: Predicted scores (B, N)
-        targets: Binary target values (B, N)
-        k: Number of items to consider
-    Returns:
-        MRR @ K
-    """
-    # Get top K item indices
-    _, top_indices = torch.topk(predictions, k, dim=1)
+def calculate_mrr(preds: torch.Tensor, targets: torch.Tensor, k: int, batch_size: int) -> float:
+    """Calculate Mean Reciprocal Rank @ K.
     
-    # Find rank of target item
-    target_indices = torch.nonzero(targets, as_tuple=True)[1]
-    reciprocal_ranks = []
+    MRR measures where the first relevant item appears in the ranking.
+    """
+    # Reshape into batches
+    preds = preds.view(-1, batch_size)
+    targets = targets.view(-1, batch_size)
     
-    for target, top_k in zip(target_indices, top_indices):
-        try:
-            rank = (top_k == target).nonzero()[0].item() + 1
-            reciprocal_ranks.append(1.0 / rank)
-        except:
-            reciprocal_ranks.append(0.0)
-            
-    return torch.tensor(reciprocal_ranks).mean().item()
+    # Get top K indices
+    _, indices = torch.topk(preds, k=min(k, preds.size(1)), dim=1)
+    
+    # Calculate reciprocal ranks
+    rr = torch.zeros(preds.size(0))
+    for i in range(preds.size(0)):
+        # Find first positive item in top K
+        target_positions = targets[i, indices[i]]
+        first_pos = torch.nonzero(target_positions, as_tuple=True)[0]
+        if len(first_pos) > 0:
+            rr[i] = 1 / (first_pos[0].item() + 1)
+    
+    return rr.mean().item()
 
-def calculate_map(predictions: torch.Tensor, targets: torch.Tensor, k: int = 10) -> float:
-    """
-    Calculate Mean Average Precision @ K
-    Args:
-        predictions: Predicted scores (B, N)
-        targets: Binary target values (B, N)
-        k: Number of items to consider
-    Returns:
-        MAP @ K
-    """
-    # Get top K item indices
-    _, top_indices = torch.topk(predictions, k, dim=1)
+def calculate_map(preds: torch.Tensor, targets: torch.Tensor, k: int, batch_size: int) -> float:
+    """Calculate Mean Average Precision @ K.
     
-    # Calculate AP for each prediction
-    aps = []
-    for top_k, target in zip(top_indices, targets):
-        relevance = target[top_k]
-        if relevance.sum() == 0:
-            aps.append(0.0)
+    MAP measures the average precision at each relevant item in the ranking.
+    """
+    # Reshape into batches
+    preds = preds.view(-1, batch_size)
+    targets = targets.view(-1, batch_size)
+    
+    # Get top K indices
+    _, indices = torch.topk(preds, k=min(k, preds.size(1)), dim=1)
+    
+    # Calculate AP for each batch
+    ap = torch.zeros(preds.size(0))
+    for i in range(preds.size(0)):
+        relevant_items = targets[i, indices[i]]
+        if relevant_items.sum() == 0:
             continue
             
-        precision_at_k = torch.cumsum(relevance, dim=0) / torch.arange(1, k + 1, device=predictions.device)
-        ap = (precision_at_k * relevance).sum() / relevance.sum()
-        aps.append(ap.item())
+        # Calculate precision at each position
+        precisions = torch.cumsum(relevant_items, dim=0) / torch.arange(1, len(relevant_items) + 1)
+        ap[i] = (precisions * relevant_items).sum() / relevant_items.sum()
+    
+    return ap.mean().item()
+
+def calculate_auc(preds: torch.Tensor, targets: torch.Tensor) -> float:
+    """Calculate Area Under the ROC Curve."""
+    try:
+        from sklearn.metrics import roc_auc_score
+        return roc_auc_score(targets.numpy(), preds.numpy())
+    except ImportError:
+        logging.warning("scikit-learn not available, calculating AUC manually")
         
-    return torch.tensor(aps).mean().item()
+        # Manual AUC calculation
+        pos_preds = preds[targets == 1]
+        neg_preds = preds[targets == 0]
+        
+        if len(pos_preds) == 0 or len(neg_preds) == 0:
+            return 0.5
+            
+        pos_preds = pos_preds.unsqueeze(1)
+        neg_preds = neg_preds.unsqueeze(0)
+        
+        comparisons = (pos_preds > neg_preds).float()
+        tie_correction = 0.5 * (pos_preds == neg_preds).float()
+        
+        return (comparisons.sum() + tie_correction.sum()) / (len(pos_preds) * len(neg_preds))
 
-def calculate_metrics(predictions: torch.Tensor, targets: torch.Tensor, k: int = 10) -> Dict[str, float]:
-    """Calculate all recommendation metrics"""
-    return {
-        'hit_rate': calculate_hit_rate(predictions, targets, k),
-        'ndcg': calculate_ndcg(predictions, targets, k),
-        'mrr': calculate_mrr(predictions, targets, k),
-        'map': calculate_map(predictions, targets, k),
-    }
-
-def print_metrics(metrics: Dict[str, float]):
-    """Pretty print metrics"""
-    print("\nEvaluation Metrics:")
-    print("-" * 40)
-    for metric, value in metrics.items():
-        print(f"{metric:>20}: {value:.4f}")
-    print("-" * 40)
+def calculate_accuracy(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> float:
+    """Calculate binary classification accuracy."""
+    return ((preds >= threshold) == targets).float().mean().item()

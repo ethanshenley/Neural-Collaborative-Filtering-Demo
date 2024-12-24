@@ -33,7 +33,7 @@ class SheetzDataset(Dataset):
         self.mode = mode
         self.negative_samples = negative_samples
         
-        # Add column validation with more comprehensive checks
+        # Add column validation with comprehensive checks
         required_cols = {
             'interactions': ['user_id', 'product_id', 'amount', 'transaction_timestamp'],
             'user_features': ['cardnumber', 'recent_interactions', 'preferred_categories'],
@@ -74,13 +74,6 @@ class SheetzDataset(Dataset):
         self.num_users = len(self.user_to_idx)
         self.num_products = len(self.product_to_idx)
         
-        # Validate all users and products have mappings
-        if not all(user in self.user_to_idx for user in interactions_df['user_id'].unique()):
-            logging.warning("Some users in interactions not found in user_features")
-            
-        if not all(prod in self.product_to_idx for prod in interactions_df['product_id'].unique()):
-            logging.warning("Some products in interactions not found in product_features")
-        
         # Split data based on time
         latest_date = pd.to_datetime(interactions_df['transaction_timestamp']).max()
         split_date = latest_date - pd.Timedelta(days=validation_days)
@@ -88,51 +81,33 @@ class SheetzDataset(Dataset):
         if mode == 'train':
             self.interactions = interactions_df[
                 pd.to_datetime(interactions_df['transaction_timestamp']) < split_date
-            ]
+            ].copy()
         else:
             self.interactions = interactions_df[
                 pd.to_datetime(interactions_df['transaction_timestamp']) >= split_date
-            ]
+            ].copy()
             
-        logging.info(f"Selected {len(self.interactions)} interactions for {mode} mode")
-        
         # Create interaction list
         self.interaction_list = self._create_interaction_list()
-        logging.info(f"Created {len(self.interaction_list)} valid interaction pairs")
+        logging.info(f"Created {len(self.interaction_list)} valid interactions")
         
-        # Initialize user-product history for training mode
+        # Calculate product weights for negative sampling
+        product_counts = np.zeros(self.num_products)
+        for _, product_idx, _ in self.interaction_list:
+            product_counts[product_idx] += 1
+            
+        # Use inverse popularity for negative sampling (less popular items more likely to be negative)
+        product_counts = np.maximum(product_counts, 1)  # Avoid division by zero
+        self.product_weights = 1 / product_counts
+        self.product_weights = self.product_weights / self.product_weights.sum()  # Normalize
+        
+        logging.info("Initialized product weights for negative sampling")
+        
+        # Initialize user-product history for negative sampling
         if mode == 'train':
             self._create_user_product_history()
-            logging.info(f"Created user-product history for {len(self.user_product_history)} users")
-        
-        # Calculate product weights for negative sampling with proper normalization
-        if 'total_purchases' in product_features_df.columns:
-            # Use inverse popularity for sampling weights
-            purchases = product_features_df['total_purchases'].fillna(1).values
-            self.product_weights = 1 / (purchases + 1)  # Add 1 to avoid division by zero
-            # Normalize to sum to 1
-            self.product_weights = self.product_weights / self.product_weights.sum()
-        else:
-            # Fallback to uniform weights if total_purchases not available
-            self.product_weights = np.ones(self.num_products) / self.num_products
-        
-        # Verify weights sum to 1
-        if not np.isclose(self.product_weights.sum(), 1.0, rtol=1e-5):
-            logging.warning("Product weights did not sum to 1, normalizing...")
-            self.product_weights = self.product_weights / self.product_weights.sum()
-        
-        # Add debugging information for training mode
-        if mode == 'train':
-            logging.info(f"Product weights stats:")
-            logging.info(f"  Min weight: {self.product_weights.min():.6f}")
-            logging.info(f"  Max weight: {self.product_weights.max():.6f}")
-            logging.info(f"  Mean weight: {self.product_weights.mean():.6f}")
-            logging.info(f"  Sum weights: {self.product_weights.sum():.6f}")
-            
-            # Verify user-product history initialization
-            if not hasattr(self, 'user_product_history'):
-                raise RuntimeError("user_product_history was not properly initialized in training mode")
-
+            logging.info(f"Created user-product history for {len(self.user_product_history)} users")  
+    
     def _create_interaction_list(self) -> List[Tuple[int, int, float]]:
         """Create list of (user_idx, product_idx, amount) tuples"""
         interactions = []
@@ -203,80 +178,147 @@ class SheetzDataset(Dataset):
     def __len__(self) -> int:
         return len(self.interaction_list)
     
-    def __getitem__(self, idx: int) -> Tuple[KeyedJaggedTensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """Get a training/validation item with proper tensor shape handling.
+        
+        Args:
+            idx: Index into interaction list
+            
+        Returns:
+            Tuple of (features dict, target tensor)
+        """
         user_idx, product_idx, amount = self.interaction_list[idx]
         
         if self.mode == 'train':
-            # Create positive sample
-            user_indices = [user_idx]
-            product_indices = [product_idx]
-            targets = [1.0]
-            
-            # Generate negative samples
-            for _ in range(self.negative_samples):
-                neg_product = self._sample_negative(user_idx, product_idx)
-                user_indices.append(user_idx)
-                product_indices.append(neg_product)
-                targets.append(0.0)
+            try:
+                # Sample negative products
+                negative_products = []
+                for _ in range(self.negative_samples):
+                    neg_product = self._sample_negative(user_idx, product_idx)
+                    negative_products.append(neg_product)
+                    
+                # Create sparse feature tensors
+                user_indices = torch.tensor([user_idx] * (1 + self.negative_samples))
+                product_indices = torch.tensor([product_idx] + negative_products)
+
+                # Create features dictionary
+                features = {
+                    'user_id': user_indices,
+                    'product_id': product_indices,
+                }
                 
-            # Create KeyedJaggedTensor properly
-            features = KeyedJaggedTensor.from_lengths_sync(
-                keys=["user_id", "product_id"],
-                values=torch.tensor(user_indices + product_indices, dtype=torch.long),
-                lengths=torch.tensor([len(user_indices), len(product_indices)], dtype=torch.long)
-            )
+                # Create binary target tensor (1 for positive, 0 for negatives)
+                targets = torch.zeros(1 + self.negative_samples, dtype=torch.float32)
+                targets[0] = 1.0
                 
-            return features, torch.tensor(targets, dtype=torch.float)
-        else:
-            # For validation/testing
-            features = KeyedJaggedTensor.from_lengths_sync(
-                keys=["user_id", "product_id"],
-                values=torch.tensor([user_idx, product_idx], dtype=torch.long),
-                lengths=torch.tensor([1, 1], dtype=torch.long)
-            )
-            
-            return features, torch.tensor([1.0], dtype=torch.float)
-              
-def collate_recommender_batch(batch: List[Tuple[KeyedJaggedTensor, torch.Tensor]]) -> Tuple[KeyedJaggedTensor, torch.Tensor]:
-    """Collate function with proper batch size guarantees"""
-    features_list = []
-    targets_list = []
-    
-    # Collect values and lengths for each key separately
-    all_values = {
-        'user_id': [],
-        'product_id': []
-    }
-    all_lengths = {
-        'user_id': [],
-        'product_id': []
-    }
-    
-    for features, targets in batch:
-        # Ensure minimum batch size
-        targets_list.append(targets)
-        
-        # Extract values and lengths correctly
-        for key in ['user_id', 'product_id']:
-            key_values = features[key].values()
-            key_lengths = features[key].lengths()
-            all_values[key].extend(key_values.tolist())
-            all_lengths[key].extend(key_lengths.tolist())
-    
-    # Create concatenated KeyedJaggedTensor with proper key structure
+                return features, targets
+                
+            except Exception as e:
+                logging.error(f"Error in __getitem__ for idx {idx}:")
+                logging.error(f"User idx: {user_idx}, Product idx: {product_idx}")
+                logging.error(f"Error details: {str(e)}")
+                raise
+                
+        else:  # Validation mode
+            # For validation, just return the single positive interaction
+            features = {
+                'user_id': torch.tensor([user_idx]),
+                'product_id': torch.tensor([product_idx])
+            }
+            return features, torch.tensor([1.0], dtype=torch.float32)
+                      
+def collate_recommender_batch(
+    batch: List[Tuple[Dict[str, torch.Tensor], torch.Tensor]]
+) -> Tuple[KeyedJaggedTensor, torch.Tensor]:
+    """
+    Collate batch of samples so each user_id and product_id is a single-element bag.
+    This allows EmbeddingBagCollection with pooling='SUM' (or 'MEAN') to effectively
+    behave as if there's no pooling.
+    """
     try:
-        features = KeyedJaggedTensor.from_lengths_sync(
-            keys=['user_id', 'product_id'],
-            values=torch.tensor(all_values['user_id'] + all_values['product_id'], dtype=torch.long),
-            lengths=torch.tensor(all_lengths['user_id'] + all_lengths['product_id'], dtype=torch.long)
+        user_values = []
+        user_lengths = []
+        
+        product_values = []
+        product_lengths = []
+        
+        all_targets = []
+        
+        # For debugging shape issues
+        sample_shapes = []
+        
+        # Loop over each item in the batch
+        for features, targets in batch:
+            # Quick checks
+            if not isinstance(features, dict):
+                raise ValueError(f"Expected dict features, got {type(features)}")
+            if set(features.keys()) != {"user_id", "product_id"}:
+                raise ValueError(f"Invalid feature keys: {features.keys()}")
+            if not isinstance(targets, torch.Tensor):
+                raise ValueError(f"Targets must be tensor, got {type(targets)}")
+
+            # For logging/debugging
+            sample_shapes.append({
+                "user_id": features["user_id"].shape,
+                "product_id": features["product_id"].shape,
+                "targets": targets.shape,
+            })
+            
+            # Suppose each sample has shape (M,) for user_id, product_id, and targets
+            # M = 1 + negative_samples for train mode, or M=1 for val/test
+            user_ids = features["user_id"]
+            product_ids = features["product_id"]
+            
+            # Each ID is its own single-element bag => length=1
+            for u in user_ids:
+                user_values.append(u.item())
+                user_lengths.append(1)
+            
+            for p in product_ids:
+                product_values.append(p.item())
+                product_lengths.append(1)
+            
+            # Same for targets: store them individually
+            for t in targets:
+                all_targets.append(t.item())
+        
+        # Convert to tensors
+        user_values_t = torch.tensor(user_values, dtype=torch.long)
+        user_lengths_t = torch.tensor(user_lengths, dtype=torch.long)
+        
+        product_values_t = torch.tensor(product_values, dtype=torch.long)
+        product_lengths_t = torch.tensor(product_lengths, dtype=torch.long)
+        
+        # Build KeyedJaggedTensor
+        # We have 2 keys: "user_id" and "product_id", each with as many single-element bags
+        features_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["user_id", "product_id"],
+            values=torch.cat([user_values_t, product_values_t], dim=0),
+            lengths=torch.cat([user_lengths_t, product_lengths_t], dim=0),
         )
         
-        return features, torch.cat(targets_list)
+        # Build target tensor
+        targets_t = torch.tensor(all_targets, dtype=torch.float32)
+        if targets_t.dim() == 1:
+            targets_t = targets_t.unsqueeze(1)  # shape => (N, 1)
+        
+        # Optional: sanity-check shapes if you want
+        # e.g. check that the # of rows in `targets_t` matches total single-element IDs
+        expected_num_ids = len(user_values)  # or len(product_values), they match
+        if targets_t.size(0) != expected_num_ids:
+            raise ValueError(
+                f"Target mismatch: got {targets_t.size(0)} rows, expected {expected_num_ids}"
+            )
+        
+        return features_kjt, targets_t
+
     except Exception as e:
-        logging.error(f"Failed to create KeyedJaggedTensor: {str(e)}")
-        logging.error(f"Values shape: {len(all_values['user_id'] + all_values['product_id'])}")
-        logging.error(f"Lengths shape: {len(all_lengths['user_id'] + all_lengths['product_id'])}")
+        logging.error("Error in collate_recommender_batch:")
+        logging.error(f"Batch size: {len(batch)}")
+        logging.error(f"Sample shapes: {sample_shapes}")
+        logging.error(f"Error details: {str(e)}")
         raise
+
 
 def create_data_loaders(
     self,
