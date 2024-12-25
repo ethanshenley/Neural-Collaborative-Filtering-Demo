@@ -8,7 +8,7 @@ gcp:
   project_id: sheetz-poc
   dataset_id: sheetz_data
   location: us-central1
-  staging_bucket: gs://sheetz-rec-staging
+  staging_bucket: sheetz-rec-staging
 vertex:
   machine_config:
     machine_type: n1-standard-8

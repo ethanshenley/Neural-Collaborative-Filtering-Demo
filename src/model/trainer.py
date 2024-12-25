@@ -348,34 +348,29 @@ class ModelTrainer:
             logging.info(f"- {name}: {value:.4f}")
 
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Validate model on validation set.
-        
-        Args:
-            val_loader: DataLoader providing validation batches
-            
-        Returns:
-            Dictionary of validation metrics
+        """
+        Validate model on validation set using top-K recommendation metrics.
         """
         self.model.eval()
         total_loss = 0.0
         all_outputs = []
         all_targets = []
-        
+
         with torch.no_grad():
             for features, targets in tqdm(val_loader, desc="Validation", leave=False):
                 try:
-                    # Move to device
+                    # 1. Move to device
                     features = features.to(self.device)
                     targets = targets.to(self.device)
                     
-                    # Forward pass
+                    # 2. Forward pass
                     outputs = self.model(features)
                     
-                    # Calculate loss
+                    # 3. Calculate loss for logging
                     loss = self.criterion(outputs, targets)
                     total_loss += loss.item()
                     
-                    # Collect predictions
+                    # 4. Collect predictions + targets for global metrics
                     all_outputs.append(outputs.cpu())
                     all_targets.append(targets.cpu())
                     
@@ -385,19 +380,33 @@ class ModelTrainer:
                     logging.error(f"Target shape: {targets.shape}")
                     logging.error(f"Error details: {str(e)}")
                     raise
+
+        # 5. Concatenate predictions/targets across all validation batches
+        all_outputs = torch.cat(all_outputs, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        val_batch_size = len(all_targets)  # Each row is just 1 user-sample
+        val_negatives = 0                  # we are not sampling negative items in val
+       
+        # 6. Calculate top-K metrics (and any others) with your function
+        #    Adjust k_values to what you want (e.g., [1, 5, 10]).
         
-        # Calculate metrics
-        all_outputs = torch.cat(all_outputs)
-        all_targets = torch.cat(all_targets)
-        
-        metrics = calculate_metrics(all_outputs, all_targets)
-        metrics['loss'] = total_loss / len(val_loader)
-        
-        # Log validation results
+        # Now pass these extra parameters:
+        metrics = calculate_metrics(
+            predictions=all_outputs,
+            targets=all_targets,
+            k_values=[1, 5, 10],
+            batch_size=val_batch_size,
+            negative_samples=val_negatives
+        )
+
+        # 7. Add average loss for the entire validation set
+        metrics["loss"] = total_loss / len(val_loader)
+
+        # 8. Log all metrics by their keys
         logging.info("\nValidation Results:")
         for name, value in metrics.items():
             logging.info(f"- {name}: {value:.4f}")
-        
+
         return metrics
     
     def train(
@@ -456,8 +465,6 @@ class ModelTrainer:
                 # Validate
                 val_metrics = self.validate(val_loader)
                 history['val_loss'].append(val_metrics['loss'])
-                history['val_hit_rate'].append(val_metrics['hit_rate'])
-                history['val_ndcg'].append(val_metrics['ndcg'])
                 
                 # Get current learning rate
                 current_lr = self.optimizer.param_groups[0]['lr']
@@ -466,14 +473,14 @@ class ModelTrainer:
                 # Calculate epoch time
                 epoch_time = time.time() - epoch_start_time
                 
-                # Log epoch results
-                self._log_epoch_results(
-                    epoch=epoch,
-                    train_loss=train_loss,
-                    val_metrics=val_metrics,
-                    learning_rate=current_lr,
-                    epoch_time=epoch_time
-                )
+                # # Log epoch results
+                # self._log_epoch_results(
+                #     epoch=epoch,
+                #     train_loss=train_loss,
+                #     val_metrics=val_metrics,
+                #     learning_rate=current_lr,
+                #     epoch_time=epoch_time
+                # )
                 
                 # Check for improvement
                 val_loss = val_metrics['loss']
