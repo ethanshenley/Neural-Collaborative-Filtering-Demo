@@ -3,3 +3,6 @@ __pycache__
 sheetz_rec.egg-info/
 logs/
 codebase.md
+.terraform/
+templates/
+.terraform.lock.hcl

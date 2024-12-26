@@ -151,3 +151,57 @@ experiment:
   tags:
     model_version: ncf_v1
     environment: development
+
+# Add to existing config.yaml
+
+inference:
+  vertex_ai:
+    endpoint_name: sheetz-rec-endpoint
+    min_replica_count: 1
+    max_replica_count: 10
+    machine_type: n1-standard-4
+    accelerator_type: NVIDIA_TESLA_T4
+    accelerator_count: 1
+
+  vector_search:
+    index_name: product-embeddings
+    dimensions: 64  # Match your embedding size
+    approximate_neighbors_count: 100
+    distance_measure: DOT_PRODUCT_DISTANCE
+
+  memorystore:
+    tier: BASIC
+    memory_size_gb: 5
+    region: us-central1
+    read_replicas_mode: READ_REPLICAS_ENABLED
+
+  cloud_run:
+    service_name: sheetz-rec-api
+    min_instances: 1
+    max_instances: 10
+    memory_limit: 2Gi
+    cpu_limit: 2
+    timeout_seconds: 30
+
+  monitoring:
+    metrics:
+      - name: recommendation_latency
+        type: GAUGE
+        unit: ms
+      - name: cache_hit_rate
+        type: GAUGE
+        unit: ratio
+      - name: requests_per_second
+        type: GAUGE
+        unit: rps
+
+  feature_engineering:
+    max_sequence_length: 50
+    temporal_features:
+      - hour_of_day
+      - day_of_week
+      - days_since_last_purchase
+    categorical_features:
+      - store_number
+      - category_id
+      - department_id
