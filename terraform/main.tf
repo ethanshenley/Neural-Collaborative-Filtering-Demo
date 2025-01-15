@@ -16,14 +16,14 @@ provider "google" {
   region  = var.region
 }
 
+# Data source for project number
+data "google_project" "current" {}
+
 # VPC Network
 resource "google_compute_network" "vpc" {
   name                    = "sheetz-rec-vpc"
   auto_create_subnetworks = true
-
-  depends_on = [
-    google_project_service.required_apis
-  ]
+  depends_on = [google_project_service.required_apis]
 }
 
 # VPC Access Connector
@@ -31,19 +31,11 @@ resource "google_vpc_access_connector" "connector" {
   name          = "sheetz-vpc-connector"
   region        = var.region
   network       = google_compute_network.vpc.name
-  ip_cidr_range = var.vpc_connector_range  # This is defined in your variables.tf as "10.8.0.0/28"
-  
-  # Machine type for the connector
-  machine_type = "e2-micro"  # Use smallest machine type to minimize costs
-  
-  # Minimum and maximum instances
+  ip_cidr_range = var.vpc_connector_range
+  machine_type  = "e2-micro"
   min_instances = 2
   max_instances = 3
-  
-  # Add dependency on API enablement
-  depends_on = [
-    google_project_service.required_apis
-  ]
+  depends_on    = [google_project_service.required_apis]
 }
 
 # Cloud Run service
@@ -62,15 +54,32 @@ resource "google_cloud_run_service" "api" {
             memory = "2Gi"
           }
         }
-        
+
+        startup_probe {
+          initial_delay_seconds = 30
+          period_seconds = 10
+          failure_threshold = 3
+          http_get {
+            path = "/health"
+          }
+        }
+
         env {
-          name  = "PROJECT_ID"
+          name  = "GOOGLE_CLOUD_PROJECT"
           value = var.project_id
         }
-        
+
         env {
-          name  = "REGION"
-          value = var.region
+          name = "MODEL_BUCKET"
+          value = var.model_artifact_bucket
+        }
+        env {
+          name = "MODEL_VERSION"
+          value = var.model_version
+        }
+        env {
+          name = "VERTEX_ENDPOINT_ID"
+          value = google_vertex_ai_endpoint.model_endpoint.name
         }
       }
     }
@@ -79,14 +88,9 @@ resource "google_cloud_run_service" "api" {
       annotations = {
         "autoscaling.knative.dev/minScale" = "1"
         "autoscaling.knative.dev/maxScale" = "10"
-        "run.googleapis.com/vpc-access-connector" = google_vpc_access_connector.connector.name
+        "run.googleapis.com/startup-cpu-boost" = "true"
       }
     }
-  }
-
-  traffic {
-    percent         = 100
-    latest_revision = true
   }
 }
 
@@ -97,18 +101,16 @@ resource "google_vertex_ai_endpoint" "model_endpoint" {
   location     = var.region
   display_name = "Recommendation System"
 
-  network = "projects/${var.project_id}/global/networks/${google_compute_network.vpc.name}"
-  
-  # Add dependency on API enablement
-  depends_on = [
-    google_project_service.required_apis
-  ]
-
   network = format(
     "projects/%s/global/networks/%s",
-    var.project_id,
+    data.google_project.current.number,
     google_compute_network.vpc.name
   )
+  
+  depends_on = [
+    google_project_service.required_apis,
+    time_sleep.api_enable
+  ]
 }
 
 # Memorystore (Redis)
@@ -124,10 +126,9 @@ resource "google_redis_instance" "cache" {
   display_name      = "Recommendation Cache"
   
   depends_on = [
-    google_project_service.required_apis
+    time_sleep.api_enable,
+    google_compute_network.vpc
   ]
-
-  depends_on = [time_sleep.api_enable]
 }
 
 # Cloud Monitoring Dashboard
@@ -173,51 +174,38 @@ resource "google_monitoring_dashboard" "recommendations" {
       ]
     }
   })
+
+  depends_on = [
+    google_project_service.required_apis
+  ]
 }
-
-# Alerting Policy
-resource "google_monitoring_alert_policy" "latency_alert" {
-  display_name = "High Inference Latency"
-  combiner     = "OR"
-
-  conditions {
-    display_name = "High latency"
-    condition_threshold {
-      filter          = "metric.type=\"custom.googleapis.com/recommendation/inference_latency\" AND resource.type=\"global\""
-      duration        = "300s"
-      comparison      = "COMPARISON_GT"
-      threshold_value = 1000
-    }
-  }
-
-  notification_channels = [google_monitoring_notification_channel.email.name]
-}
-
-# Notification Channel
-resource "google_monitoring_notification_channel" "email" {
-  display_name = "Recommendation Alerts"
-  type         = "email"
-  
-  labels = {
-    email_address = var.alert_email
-  }
-}
-
-# IAM role for service account
+# Service Account
 resource "google_service_account" "inference_sa" {
   account_id   = "inference-service"
   display_name = "Inference Service Account"
 }
 
+# IAM roles
 resource "google_project_iam_member" "inference_roles" {
   for_each = toset([
     "roles/aiplatform.user",
     "roles/bigquery.dataViewer",
     "roles/redis.viewer",
-    "roles/monitoring.metricWriter"
+    "roles/monitoring.metricWriter",
+    "roles/run.invoker",
+    "roles/run.serviceAgent",
+    "roles/cloudtrace.agent",
+    "roles/logging.logWriter"
   ])
   
   role    = each.key
   member  = "serviceAccount:${google_service_account.inference_sa.email}"
   project = var.project_id
+}
+
+# Allow Cloud Run to use the service account
+resource "google_service_account_iam_member" "cloud_run_service_account" {
+  service_account_id = google_service_account.inference_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${data.google_project.current.number}-compute@developer.gserviceaccount.com"
 }

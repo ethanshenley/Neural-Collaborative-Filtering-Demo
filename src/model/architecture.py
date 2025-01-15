@@ -405,3 +405,12 @@ class AdvancedNCF(nn.Module):
             "mlp": self.mlp_norm(mlp_embeddings["product_id"]),
             "category": category_embeds
         }
+
+    def forward_simple(self, user_ids, product_ids):
+        """Simple forward pass with direct tensor inputs"""
+        user_emb = self.mf_user_embedding(user_ids)
+        product_emb = self.mf_product_embedding(product_ids)
+        
+        # Compute dot product
+        dot_product = (user_emb * product_emb).sum(dim=1)
+        return dot_product

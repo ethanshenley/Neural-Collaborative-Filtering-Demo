@@ -9,6 +9,7 @@ gcp:
   dataset_id: sheetz_data
   location: us-central1
   staging_bucket: sheetz-rec-staging
+  region: us-central1
 vertex:
   machine_config:
     machine_type: n1-standard-8
@@ -97,6 +98,8 @@ model:
     num_products: null  # will be set from data
     num_users: null    # will be set from data
     num_negative_samples: 4
+
+    model_save_path: "models/train_20241225_002713/train_20241225_002713_model.pt"
 
 # Logging settings
 logging:

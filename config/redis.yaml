@@ -1,0 +1,6 @@
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  ttl: 3600  # Cache TTL in seconds
+  project_id: "sheetz-poc"  # Add this line for GCP monitoring

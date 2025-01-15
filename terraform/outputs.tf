@@ -33,11 +33,6 @@ output "dashboard_url" {
   value       = format("https://console.cloud.google.com/monitoring/dashboards/%s", google_monitoring_dashboard.recommendations.id)
 }
 
-output "alert_policy_name" {
-  description = "Name of the latency alert policy"
-  value       = google_monitoring_alert_policy.latency_alert.name
-}
-
 output "environment" {
   description = "Deployment environment"
   value       = var.environment

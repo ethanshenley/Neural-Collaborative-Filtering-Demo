@@ -1,8 +1,10 @@
 __pycache__
-,env
+.env
 sheetz_rec.egg-info/
 logs/
 codebase.md
 .terraform/
 templates/
 .terraform.lock.hcl
+src/data/data_samples
+config/*.json

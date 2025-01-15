@@ -25,11 +25,18 @@ COPY setup.py .
 # Install the package
 RUN pip install -e .
 
-# Expose port for FastAPI
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV GOOGLE_CLOUD_PROJECT=sheetz-poc
+
+# Make sure you're exposing the correct port
 EXPOSE 8080
 
-# Environment variables
-ENV PORT=8080
+# Add to Dockerfile.api
+RUN apt-get update && apt-get install -y curl
 
+# Update healthcheck
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 # Start command
-CMD ["python", "-m", "src.api.routes"]
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "debug"]

@@ -1,0 +1,15 @@
+#endpoints.yaml
+redis:
+  host: 10.233.197.211
+  instance_id: sheetz-rec-cache
+  port: 6379
+  region: us-central1
+vector_search:
+  dimensions: 64
+  distance_measure: DOT_PRODUCT_DISTANCE
+  index_name: product_embeddings
+vertex_ai:
+  endpoint_id: '3832382962985336832'
+  index_id: sheetz_rec_index_20250107_104005
+  project_id: sheetz-poc
+  region: us-central1

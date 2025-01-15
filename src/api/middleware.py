@@ -1,7 +1,7 @@
 # src/api/middleware.py
 
 from fastapi import Request, Response
-from fastapi.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from google.cloud import monitoring_v3
 import time
 import logging
