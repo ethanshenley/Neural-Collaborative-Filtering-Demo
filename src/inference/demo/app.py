@@ -4,6 +4,7 @@ import streamlit as st
 from pathlib import Path
 import sys
 import json
+from datetime import datetime
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -32,47 +33,48 @@ def load_model(checkpoint_path: str, device: str = "cpu") -> AdvancedNCF:
     model.eval()
     return model
 
-def get_recommendations(model, user_id: int, products_df: pd.DataFrame, top_k: int = 10):
-    """Get top-k product recommendations for a user"""
-    # Create test pairs for all products
-    test_pairs = []
-    for _, product in products_df.iterrows():
-        product_id = int(product['product_id'].lstrip('P'), 16) % 366
-        test_pairs.append({
-            'user_id': user_id % 8031,  # Match model's num_users
-            'product_id': product_id,
-            'original_product_id': product['product_id']
-        })
-    
-    df = pd.DataFrame(test_pairs)
-    
-    # Get device from model parameters
+def prepare_temporal_features(hour: int):
+    # Convert hour to model's temporal encoding
+    hour_tensor = torch.zeros(24)
+    hour_tensor[hour] = 1.0
+    return hour_tensor
+
+def get_recommendations(model, customer_id, products_df, top_k, selected_hour):
+    """Get recommendations with temporal features"""
     device = next(model.parameters()).device
     
-    # Create KeyedJaggedTensor for inference
-    user_values = df['user_id'].tolist()
-    product_values = df['product_id'].tolist()
-    values = torch.tensor(user_values + product_values, dtype=torch.long, device=device)
-    lengths = torch.tensor([1] * len(df) * 2, dtype=torch.long, device=device)
+    # Parse hour from "H:00 AM/PM" format
+    hour_str, meridiem = selected_hour.split()
+    hour = int(hour_str.split(":")[0])
     
-    kjt = KeyedJaggedTensor.from_lengths_sync(
-        keys=["user_id", "product_id"],
-        values=values,
-        lengths=lengths,
-    )
+    # Convert to 24-hour format
+    if meridiem == "PM" and hour != 12:
+        hour += 12
+    elif meridiem == "AM" and hour == 12:
+        hour = 0
+    
+    # Create tensors for all products
+    all_products = torch.arange(len(products_df), device=device) % 366
+    customer_tensor = torch.full((len(all_products),), customer_id, device=device)
+    hour_tensor = torch.full((len(all_products),), hour, device=device)
     
     # Get predictions
     with torch.no_grad():
-        scores = torch.sigmoid(model(kjt)).cpu().numpy()
+        scores = model.forward_simple(
+            customer_tensor,
+            all_products,
+            hour_tensor
+        )
     
-    # Add scores to DataFrame
-    df['score'] = scores
+    # Create recommendations DataFrame
+    recommendations = products_df.copy()
+    recommendations['score'] = scores.cpu().numpy()
+    recommendations['time_context'] = selected_hour
     
-    # Merge with product info
-    results = df.merge(products_df, left_on='original_product_id', right_on='product_id', suffixes=('', '_full'))
+    # Sort and get top-k
+    recommendations = recommendations.nlargest(top_k, 'score')
     
-    # Sort and get top k
-    return results.nlargest(top_k, 'score')
+    return recommendations
 
 def main():
     # Configure page
@@ -230,21 +232,54 @@ def main():
         )
         top_k = st.sidebar.slider("Number of recommendations:", min_value=1, max_value=20, value=10)
         
+        # Time selection
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### Time Settings")
+        hour_options = [
+            f"{i if i <= 12 else i-12}:00 {'AM' if i < 12 else 'PM'}" 
+            for i in range(24)
+        ]
+        hour_options[0] = "12:00 AM"  # Fix midnight
+        hour_options[12] = "12:00 PM"  # Fix noon
+
+        selected_hour = st.sidebar.selectbox(
+            "Select Time for Recommendations:",
+            options=hour_options,
+            index=datetime.now().hour,
+            help="Select the time of day to optimize recommendations"
+        )
+        
+        # Add time context indicator
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.markdown("### Current Settings")
+            st.markdown(f"🕒 Time Context: **{selected_hour}**")
+        with col2:
+            if selected_hour == f"{datetime.now().hour:02d}:00":
+                st.success("Using current time")
+            else:
+                st.info("Using custom time")
+        
         if st.sidebar.button("Get Recommendations"):
             # Convert customer ID to model's range
             customer_id = int(selected_customer) % 8031
             
             with st.spinner("Generating recommendations..."):
-                recommendations = get_recommendations(model, customer_id, products_df, top_k)
+                recommendations = get_recommendations(model, customer_id, products_df, top_k, selected_hour)
                 
-                st.subheader(f"Top {top_k} Recommended Products")
+                st.subheader(f"Top {top_k} Recommended Products for {selected_hour}")
+                
+                # Add time context info
+                st.info(f"🕒 Showing recommendations optimized for {selected_hour}")
+                
                 for _, rec in recommendations.iterrows():
                     with st.container():
                         cols = st.columns([3, 1])
                         with cols[0]:
                             st.markdown(f"""
                             **{rec['product_name']}**  
-                            Category: {rec['category_id']} | Dept: {rec['department_id']}
+                            Category: {rec['category_id']} | Dept: {rec['department_id']}  
+                            Time Context: {rec['time_context']}
                             """)
                         with cols[1]:
                             score_pct = f"{rec['score']*100:.1f}%"

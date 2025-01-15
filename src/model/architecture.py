@@ -406,11 +406,80 @@ class AdvancedNCF(nn.Module):
             "category": category_embeds
         }
 
-    def forward_simple(self, user_ids, product_ids):
-        """Simple forward pass with direct tensor inputs"""
-        user_emb = self.mf_user_embedding(user_ids)
-        product_emb = self.mf_product_embedding(product_ids)
+    def forward_simple(self, user_ids, product_ids, hour=None):
+        """Simple forward pass with direct tensor inputs and temporal features
         
-        # Compute dot product
-        dot_product = (user_emb * product_emb).sum(dim=1)
-        return dot_product
+        Args:
+            user_ids: Tensor of user IDs
+            product_ids: Tensor of product IDs
+            hour: Optional tensor of hour indices (0-23)
+        """
+        # Create KeyedJaggedTensor for embeddings
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["user_id", "product_id"],
+            values=torch.cat([user_ids, product_ids]),
+            lengths=torch.ones(len(user_ids) * 2, dtype=torch.long, device=user_ids.device)
+        )
+        
+        # Get embeddings
+        mf_embeddings = self.mf_embedding_collection(features)
+        mlp_embeddings = self.mlp_embedding_collection(features)
+        
+        # Process MF path
+        user_mf = self.mf_norm(mf_embeddings["user_id"])
+        product_mf = self.mf_norm(mf_embeddings["product_id"])
+        
+        # Add temporal features if provided
+        if hour is not None:
+            temporal_embeds = self.temporal_encoding.hour_embed(hour)
+            # Project temporal embeddings to match MF dimension if needed
+            if temporal_embeds.size(-1) != self.mf_embedding_dim:
+                temporal_projection = nn.Linear(
+                    self.temporal_dim, 
+                    self.mf_embedding_dim,
+                    device=user_ids.device
+                )
+                temporal_embeds = temporal_projection(temporal_embeds)
+            # Directly modify product embeddings based on time
+            product_mf = product_mf * (1 + 0.3 * temporal_embeds)  # Scale temporal influence
+        
+        # Get MF prediction with temporal influence
+        mf_vector = user_mf * product_mf
+        mf_pred = self.mf_output(mf_vector)
+        
+        # Process MLP path similarly
+        user_mlp = self.mlp_norm(mlp_embeddings["user_id"])
+        product_mlp = self.mlp_norm(mlp_embeddings["product_id"])
+        
+        if hour is not None:
+            # Also influence MLP path
+            product_mlp = product_mlp * (1 + 0.3 * temporal_embeds)
+        
+        # Apply attention
+        user_product_attn = self.user_product_attention(
+            user_mlp.unsqueeze(1),
+            product_mlp.unsqueeze(1),
+            product_mlp.unsqueeze(1)
+        ).squeeze(1)
+        
+        # Process through MLP
+        if hour is not None:
+            temporal_embeds = self.temporal_encoding.hour_embed(hour)
+            combined_features = torch.cat([user_product_attn, temporal_embeds], dim=1)
+        else:
+            # Create zero temporal embeddings
+            temporal_embeds = torch.zeros(
+                len(user_ids), 
+                self.temporal_dim,
+                device=user_ids.device,
+                dtype=user_product_attn.dtype
+            )
+            combined_features = torch.cat([user_product_attn, temporal_embeds], dim=1)
+        
+        # Use the same MLP architecture as in the main forward pass
+        mlp_vector = self.mlp(combined_features)
+        mlp_pred = self.mlp_output(mlp_vector)
+        
+        # Final combination
+        combined = torch.cat([mf_pred, mlp_pred], dim=1)
+        return self.final(combined).squeeze(-1)
