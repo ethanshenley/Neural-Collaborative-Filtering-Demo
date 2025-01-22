@@ -435,13 +435,6 @@ def main():
         }
         </style>
     """, unsafe_allow_html=True)
-
-    # Add Sheetz logo
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        st.image("src/inference/demo/sheetz.png", width=200)
-    with col2:
-        st.markdown('<h1 style="margin-top: 1.8rem;">Sheetz Product Recommender</h1>', unsafe_allow_html=True)
     
     try:
         # Load data with correct paths

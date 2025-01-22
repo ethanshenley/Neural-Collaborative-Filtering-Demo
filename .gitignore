@@ -8,3 +8,4 @@ templates/
 .terraform.lock.hcl
 src/data/data_samples
 config/*.json
+.aidigestignore
