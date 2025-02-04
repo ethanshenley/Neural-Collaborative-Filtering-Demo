@@ -250,7 +250,7 @@ def add_model_intelligence_dashboard(model, recommendations, customer_id, use_te
 def main():
     # Configure page
     st.set_page_config(
-        page_title="Sheetz Product Recommender",
+        page_title="Neural Collaborative Filtering Inference",
         page_icon="🛒",
         layout="wide"
     )
